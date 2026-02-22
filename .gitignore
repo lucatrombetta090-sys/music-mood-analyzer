@@ -1,0 +1,22 @@
+# Build artifacts
+.buildozer/
+bin/
+*.apk
+*.aab
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Cache & database (generati dall'app a runtime)
+music_cache.json
+listening_history.db
+music_analyzer.log
+
+# OS
+.DS_Store
+Thumbs.db
