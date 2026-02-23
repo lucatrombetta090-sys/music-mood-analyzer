@@ -3,65 +3,71 @@ name: Build APK
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:   # Permette avvio manuale dalla UI di GitHub
+  workflow_dispatch:
 
 jobs:
   build-apk:
     name: Build Music Mood Analyzer APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
-      # 1. Scarica il codice
       - name: Checkout codice
         uses: actions/checkout@v4
 
-      # 2. Configura Python
       - name: Configura Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      # 3. Installa dipendenze sistema necessarie per buildozer
+      - name: Cache buildozer (SDK/NDK/p4a)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            ~/.gradle
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-${{ runner.os }}-
+
       - name: Installa dipendenze sistema
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            python3-pip \
-            python3-venv \
-            git \
-            zip \
-            unzip \
-            openjdk-17-jdk \
-            ccache \
-            libffi-dev \
-            libssl-dev \
-            autoconf \
-            automake \
-            libtool \
-            pkg-config \
-            zlib1g-dev \
-            libncurses5-dev \
-            cmake \
-            libltdl-dev \
-            libgdbm-dev \
-            libbz2-dev \
-            libsqlite3-dev \
-            lzma \
-            liblzma-dev \
-            libreadline-dev
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip openjdk-17-jdk \
+            ccache libffi-dev libssl-dev \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev cmake \
+            libltdl-dev libgdbm-dev libbz2-dev \
+            libsqlite3-dev lzma liblzma-dev \
+            libreadline-dev build-essential \
+            python3-pip python3-venv
 
-      # 4. Usa l'Action ufficiale di buildozer per Kivy
-      - name: Compila APK con Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
-        with:
-          command: android debug
-          buildozer_version: stable
+      - name: Installa buildozer e Cython
+        run: |
+          pip install --upgrade pip
+          pip install buildozer==1.5.0 cython==0.29.37
 
-      # 5. Carica l'APK come artefatto scaricabile
-      - name: Carica APK
+      - name: Compila APK
+        run: |
+          buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Trova APK generato
+        id: find_apk
+        run: |
+          APK=$(find bin/ -name "*.apk" | head -1)
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          echo "APK trovato: $APK"
+
+      - name: Carica APK come artefatto
         uses: actions/upload-artifact@v4
         with:
           name: MusicMoodAnalyzer-APK
-          path: ${{ steps.buildozer.outputs.filename }}
-          retention-days: 30    # Disponibile per 30 giorni
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          retention-days: 30
+
+      - name: Carica log in caso di errore
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
