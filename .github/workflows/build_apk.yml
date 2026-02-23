@@ -52,11 +52,12 @@ jobs:
           pip install --upgrade pip wheel
           pip install buildozer==1.5.0 cython==0.29.37
 
-      - name: Pre-installa Android SDK con sdkmanager
+      - name: Installa Android SDK e crea symlink per buildozer
         run: |
           SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
           mkdir -p "$SDK_ROOT/cmdline-tools"
 
+          # Scarica command-line tools Google
           wget -q \
             https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
             -O /tmp/cmdtools.zip
@@ -65,24 +66,42 @@ jobs:
 
           SDKMGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
 
+          # ── SYMLINK: buildozer cerca sdkmanager nel percorso VECCHIO ──────
+          # tools/bin/sdkmanager → cmdline-tools/latest/bin/sdkmanager
+          mkdir -p "$SDK_ROOT/tools/bin"
+          ln -sf "$SDKMGR" "$SDK_ROOT/tools/bin/sdkmanager"
+          chmod +x "$SDK_ROOT/tools/bin/sdkmanager"
+
+          # Accetta licenze
           yes | "$SDKMGR" --sdk_root="$SDK_ROOT" --licenses 2>/dev/null || true
 
+          # Installa componenti stabili
           "$SDKMGR" --sdk_root="$SDK_ROOT" \
             "platforms;android-33" \
             "build-tools;34.0.0" \
             "platform-tools"
 
+          # Scrivi file licenze manualmente
           mkdir -p "$SDK_ROOT/licenses"
           printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" \
             > "$SDK_ROOT/licenses/android-sdk-license"
           printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
             > "$SDK_ROOT/licenses/android-sdk-preview-license"
 
+          # Variabili ambiente
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_HOME=$SDK_ROOT"     >> $GITHUB_ENV
+          echo "$SDK_ROOT/tools/bin"                >> $GITHUB_PATH
           echo "$SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$SDK_ROOT/platform-tools"           >> $GITHUB_PATH
           echo "$SDK_ROOT/build-tools/34.0.0"       >> $GITHUB_PATH
+
+          # Verifica
+          echo "=== Verifica sdkmanager paths ==="
+          ls -la "$SDK_ROOT/tools/bin/sdkmanager"
+          ls -la "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "=== build-tools installati ==="
+          ls "$SDK_ROOT/build-tools/" 2>/dev/null || echo "nessuno"
 
       - name: Compila APK
         run: |
@@ -93,8 +112,8 @@ jobs:
         run: |
           APK=$(find bin/ -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK" ]; then
-            echo "APK non trovato - ultimi 80 righe log:"
-            tail -80 build.log
+            echo "APK non trovato - ultimi 100 righe log:"
+            tail -100 build.log
             exit 1
           fi
           echo "apk_path=$APK" >> $GITHUB_OUTPUT
