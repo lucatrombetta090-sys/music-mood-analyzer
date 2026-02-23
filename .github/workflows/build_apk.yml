@@ -41,21 +41,49 @@ jobs:
             libreadline-dev build-essential \
             python3-pip python3-venv
 
+      - name: Configura Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
       - name: Installa buildozer e Cython
         run: |
-          pip install --upgrade pip
+          pip install --upgrade pip wheel
           pip install buildozer==1.5.0 cython==0.29.37
+
+      - name: Accetta licenze Android SDK
+        run: |
+          mkdir -p "$HOME/.buildozer/android/platform/android-sdk/licenses"
+          # Licenze standard SDK
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" \
+            > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license"
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" \
+            >> "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license"
+          # Licenza preview (copre anche RC)
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" \
+            > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license"
+          # Licenza NDK
+          echo "504667f4c0de7af1a06de9f4b1727b84351f2910" \
+            > "$HOME/.buildozer/android/platform/android-sdk/licenses/android-googletv-license"
+          # Forza accettazione con sdkmanager se disponibile
+          yes | sdkmanager --licenses 2>/dev/null || true
 
       - name: Compila APK
         run: |
           buildozer -v android debug 2>&1 | tee build.log
 
-      - name: Trova APK generato
+      - name: Trova e verifica APK
         id: find_apk
         run: |
-          APK=$(find bin/ -name "*.apk" | head -1)
+          APK=$(find bin/ -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "❌ APK non trovato! Ultimi 50 log:"
+            tail -50 build.log
+            exit 1
+          fi
           echo "apk_path=$APK" >> $GITHUB_OUTPUT
-          echo "APK trovato: $APK"
+          echo "✅ APK trovato: $APK ($(du -h "$APK" | cut -f1))"
 
       - name: Carica APK come artefatto
         uses: actions/upload-artifact@v4
