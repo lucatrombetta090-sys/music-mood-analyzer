@@ -1,0 +1,67 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:   # Permette avvio manuale dalla UI di GitHub
+
+jobs:
+  build-apk:
+    name: Build Music Mood Analyzer APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Scarica il codice
+      - name: Checkout codice
+        uses: actions/checkout@v4
+
+      # 2. Configura Python
+      - name: Configura Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # 3. Installa dipendenze sistema necessarie per buildozer
+      - name: Installa dipendenze sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-pip \
+            python3-venv \
+            git \
+            zip \
+            unzip \
+            openjdk-17-jdk \
+            ccache \
+            libffi-dev \
+            libssl-dev \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            zlib1g-dev \
+            libncurses5-dev \
+            cmake \
+            libltdl-dev \
+            libgdbm-dev \
+            libbz2-dev \
+            libsqlite3-dev \
+            lzma \
+            liblzma-dev \
+            libreadline-dev
+
+      # 4. Usa l'Action ufficiale di buildozer per Kivy
+      - name: Compila APK con Buildozer
+        uses: ArtemSBulgakov/buildozer-action@v1
+        id: buildozer
+        with:
+          command: android debug
+          buildozer_version: stable
+
+      # 5. Carica l'APK come artefatto scaricabile
+      - name: Carica APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicMoodAnalyzer-APK
+          path: ${{ steps.buildozer.outputs.filename }}
+          retention-days: 30    # Disponibile per 30 giorni
