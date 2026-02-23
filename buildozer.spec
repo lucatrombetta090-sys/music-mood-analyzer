@@ -19,9 +19,11 @@ orientation      = portrait
 
 # ── Android specifiche ────────────────────────────────────────────────────────
 android.minapi           = 24
-android.api              = 34
+android.api              = 33
 android.ndk              = 25b
-android.sdk              = 34
+android.sdk              = 33
+# Forza build-tools stabile (evita RC come 37.0.0-rc1)
+android.build_tools_version = 34.0.0
 android.archs            = arm64-v8a,armeabi-v7a
 android.allow_backup     = True
 
@@ -34,16 +36,11 @@ android.permissions      = \
 # Supporto file audio MP3 su Android 13+
 android.features         = android.hardware.audio.output
 
-# Gradle
-android.gradle_dependencies = com.google.android.gms:play-services-base:18.0.1
+# Accetta automaticamente le licenze SDK
+android.accept_sdk_license = True
 
-# ── Python-for-Android recipes personalizzate ─────────────────────────────────
-# Le seguenti recipe compilano librosa e le sue dipendenze per ARM.
-# Assicurati di avere p4a aggiornato (python-for-android >= 2024.01)
+# ── Python-for-Android ────────────────────────────────────────────────────────
 p4a.branch = develop
-
-# Eventuale fork con recipe librosa se non presente in upstream
-# p4a.source_dir = /path/to/custom/p4a
 
 # ── Build ────────────────────────────────────────────────────────────────────
 [buildozer]
