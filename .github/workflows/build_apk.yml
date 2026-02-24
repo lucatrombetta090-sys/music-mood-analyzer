@@ -57,7 +57,6 @@ jobs:
           SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
           mkdir -p "$SDK_ROOT/cmdline-tools"
 
-          # Scarica command-line tools Google
           wget -q \
             https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
             -O /tmp/cmdtools.zip
@@ -66,29 +65,24 @@ jobs:
 
           SDKMGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
 
-          # ── SYMLINK: buildozer cerca sdkmanager nel percorso VECCHIO ──────
-          # tools/bin/sdkmanager → cmdline-tools/latest/bin/sdkmanager
+          # Symlink percorso vecchio che buildozer cerca
           mkdir -p "$SDK_ROOT/tools/bin"
           ln -sf "$SDKMGR" "$SDK_ROOT/tools/bin/sdkmanager"
           chmod +x "$SDK_ROOT/tools/bin/sdkmanager"
 
-          # Accetta licenze
           yes | "$SDKMGR" --sdk_root="$SDK_ROOT" --licenses 2>/dev/null || true
 
-          # Installa componenti stabili
           "$SDKMGR" --sdk_root="$SDK_ROOT" \
             "platforms;android-33" \
             "build-tools;34.0.0" \
             "platform-tools"
 
-          # Scrivi file licenze manualmente
           mkdir -p "$SDK_ROOT/licenses"
           printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" \
             > "$SDK_ROOT/licenses/android-sdk-license"
           printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
             > "$SDK_ROOT/licenses/android-sdk-preview-license"
 
-          # Variabili ambiente
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_HOME=$SDK_ROOT"     >> $GITHUB_ENV
           echo "$SDK_ROOT/tools/bin"                >> $GITHUB_PATH
@@ -96,24 +90,41 @@ jobs:
           echo "$SDK_ROOT/platform-tools"           >> $GITHUB_PATH
           echo "$SDK_ROOT/build-tools/34.0.0"       >> $GITHUB_PATH
 
-          # Verifica
-          echo "=== Verifica sdkmanager paths ==="
-          ls -la "$SDK_ROOT/tools/bin/sdkmanager"
-          ls -la "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          echo "=== build-tools installati ==="
-          ls "$SDK_ROOT/build-tools/" 2>/dev/null || echo "nessuno"
-
       - name: Compila APK
         run: |
           buildozer -v android debug 2>&1 | tee build.log
+          echo "Exit code: $?"
+
+      # Sempre carica il log completo (successo O errore)
+      - name: Carica log completo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-completo
+          path: build.log
+          retention-days: 7
+
+      - name: Mostra errore reale (righe prima di ENVIRONMENT)
+        if: failure()
+        run: |
+          echo "=== ULTIME 200 RIGHE PRIMA DEL DUMP ENVIRONMENT ==="
+          # Trova la riga dove inizia ENVIRONMENT e mostra 200 righe prima
+          ENV_LINE=$(grep -n "^# ENVIRONMENT:" build.log | head -1 | cut -d: -f1)
+          if [ -n "$ENV_LINE" ] && [ "$ENV_LINE" -gt 10 ]; then
+            START=$(( ENV_LINE - 200 ))
+            [ $START -lt 1 ] && START=1
+            sed -n "${START},${ENV_LINE}p" build.log
+          else
+            # Nessun ENVIRONMENT trovato, mostra le ultime 200 righe normali
+            tail -200 build.log
+          fi
 
       - name: Trova e verifica APK
         id: find_apk
         run: |
           APK=$(find bin/ -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK" ]; then
-            echo "APK non trovato - ultimi 100 righe log:"
-            tail -100 build.log
+            echo "APK non trovato."
             exit 1
           fi
           echo "apk_path=$APK" >> $GITHUB_OUTPUT
@@ -125,11 +136,3 @@ jobs:
           name: MusicMoodAnalyzer-APK
           path: ${{ steps.find_apk.outputs.apk_path }}
           retention-days: 30
-
-      - name: Carica log in caso di errore
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          retention-days: 7
