@@ -1,8 +1,8 @@
 """
 audio_decode.py — Decodifica MP3 → PCM float32 mono
 
-Android: usa MediaExtractor + MediaCodec via pyjnius (Java API nativa)
-Desktop: usa scipy.io.wavfile o soundfile come fallback per sviluppo/test
+Android : MediaExtractor + MediaCodec via pyjnius (Java nativa, zero dipendenze extra)
+Desktop  : soundfile (pip install soundfile) oppure wave per WAV
 """
 
 import os
@@ -11,50 +11,37 @@ from typing import Tuple
 
 
 def load_audio(path: str, duration: float = 90.0) -> Tuple[np.ndarray, int]:
-    """
-    Carica un file MP3 e ritorna (y, sr) con:
-      y  = array float32 mono, normalizzato in [-1, 1]
-      sr = sample rate (Hz)
-
-    Su Android usa MediaCodec; su desktop usa fallback.
-    Analizza al massimo `duration` secondi (default 90s).
-    """
     try:
-        from jnius import autoclass
-        return _load_android(path, duration)
+        from jnius import autoclass   # disponibile solo su Android
+        return _android(path, duration)
     except ImportError:
-        return _load_desktop(path, duration)
+        return _desktop(path, duration)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Android: MediaExtractor + MediaCodec
+# Android — MediaCodec (nessuna dipendenza Python esterna)
 # ─────────────────────────────────────────────────────────────────────────────
-def _load_android(path: str, max_dur: float) -> Tuple[np.ndarray, int]:
+def _android(path: str, max_dur: float) -> Tuple[np.ndarray, int]:
     from jnius import autoclass
-    import array as pyarray
+    MediaExtractor = autoclass("android.media.MediaExtractor")
+    MediaCodec     = autoclass("android.media.MediaCodec")
+    MediaFormat    = autoclass("android.media.MediaFormat")
+    BufferInfo     = autoclass("android.media.MediaCodec$BufferInfo")
 
-    MediaExtractor  = autoclass("android.media.MediaExtractor")
-    MediaCodec      = autoclass("android.media.MediaCodec")
-    MediaFormat     = autoclass("android.media.MediaFormat")
-    BufferInfo      = autoclass("android.media.MediaCodec$BufferInfo")
+    ext = MediaExtractor()
+    ext.setDataSource(path)
 
-    extractor = MediaExtractor()
-    extractor.setDataSource(path)
-
-    # Trova traccia audio
-    audio_idx = -1
-    fmt = None
-    for i in range(extractor.getTrackCount()):
-        f = extractor.getTrackFormat(i)
+    audio_idx, fmt = -1, None
+    for i in range(ext.getTrackCount()):
+        f = ext.getTrackFormat(i)
         mime = f.getString(MediaFormat.KEY_MIME)
         if mime and mime.startswith("audio/"):
-            audio_idx = i
-            fmt = f
+            audio_idx, fmt = i, f
             break
     if audio_idx < 0:
-        raise RuntimeError(f"Nessuna traccia audio in {path}")
+        raise RuntimeError(f"Nessuna traccia audio: {path}")
 
-    extractor.selectTrack(audio_idx)
+    ext.selectTrack(audio_idx)
     sr       = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
     channels = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
 
@@ -62,64 +49,47 @@ def _load_android(path: str, max_dur: float) -> Tuple[np.ndarray, int]:
     codec.configure(fmt, None, None, 0)
     codec.start()
 
-    pcm_bytes = bytearray()
-    info      = BufferInfo()
-    TIMEOUT   = 10_000   # µs
-    max_bytes = int(max_dur * sr * channels * 2)  # int16 = 2 bytes
-    done      = False
+    pcm      = bytearray()
+    info     = BufferInfo()
+    TIMEOUT  = 10_000
+    max_bytes = int(max_dur * sr * channels * 2)
+    done     = False
 
-    while not done and len(pcm_bytes) < max_bytes:
-        # Feed input
+    while not done and len(pcm) < max_bytes:
         in_idx = codec.dequeueInputBuffer(TIMEOUT)
         if in_idx >= 0:
-            buf   = codec.getInputBuffer(in_idx)
-            n     = extractor.readSampleData(buf, 0)
+            buf = codec.getInputBuffer(in_idx)
+            n   = ext.readSampleData(buf, 0)
             if n < 0:
                 codec.queueInputBuffer(in_idx, 0, 0, 0,
                     MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                 done = True
             else:
-                pts = extractor.getSampleTime()
-                codec.queueInputBuffer(in_idx, 0, n, pts, 0)
-                extractor.advance()
+                codec.queueInputBuffer(in_idx, 0, n, ext.getSampleTime(), 0)
+                ext.advance()
 
-        # Drain output
         out_idx = codec.dequeueOutputBuffer(info, TIMEOUT)
         if out_idx >= 0:
             buf = codec.getOutputBuffer(out_idx)
             buf.limit(info.size)
-            chunk = buf.array()[buf.arrayOffset():buf.arrayOffset() + info.size]
-            pcm_bytes.extend(chunk)
+            pcm.extend(buf.array()[buf.arrayOffset():buf.arrayOffset()+info.size])
             codec.releaseOutputBuffer(out_idx, False)
             if info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM:
                 done = True
 
-    codec.stop(); codec.release()
-    extractor.release()
+    codec.stop(); codec.release(); ext.release()
 
-    # int16 → float32 mono
-    arr = np.frombuffer(bytes(pcm_bytes), dtype=np.int16).astype(np.float32)
-    arr /= 32768.0
+    arr = np.frombuffer(bytes(pcm), dtype=np.int16).astype(np.float32) / 32768.0
     if channels > 1:
         arr = arr.reshape(-1, channels).mean(axis=1)
-
-    # Tronca a max_dur
-    max_samples = int(max_dur * sr)
-    arr = arr[:max_samples]
-    return arr, sr
+    return arr[:int(max_dur * sr)], sr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Desktop fallback (sviluppo/test)
+# Desktop fallback — soundfile (solo per sviluppo/test, NON serve su Android)
 # ─────────────────────────────────────────────────────────────────────────────
-def _load_desktop(path: str, max_dur: float) -> Tuple[np.ndarray, int]:
-    """
-    Prova in ordine: soundfile → scipy.io.wavfile → errore.
-    Per MP3 su desktop durante lo sviluppo usa soundfile (pip install soundfile).
-    """
-    ext = os.path.splitext(path)[1].lower()
-
-    # 1. soundfile (supporta MP3 via libsndfile ≥ 1.1.0, WAV, FLAC, OGG…)
+def _desktop(path: str, max_dur: float) -> Tuple[np.ndarray, int]:
+    # Prova soundfile (supporta MP3 se libsndfile >= 1.1.0)
     try:
         import soundfile as sf
         y, sr = sf.read(path, dtype="float32", always_2d=False)
@@ -129,20 +99,25 @@ def _load_desktop(path: str, max_dur: float) -> Tuple[np.ndarray, int]:
     except Exception:
         pass
 
-    # 2. scipy.io.wavfile (solo WAV)
+    # Fallback WAV con wave stdlib
     try:
-        from scipy.io import wavfile
-        sr, data = wavfile.read(path)
-        if data.ndim > 1:
-            data = data.mean(axis=1)
-        y = data.astype(np.float32)
-        if y.max() > 1.0:
-            y /= 32768.0
-        return y[:int(max_dur * sr)], int(sr)
+        import wave, struct
+        with wave.open(path, "rb") as wf:
+            sr  = wf.getframerate()
+            ch  = wf.getnchannels()
+            sw  = wf.getsampwidth()
+            n   = min(wf.getnframes(), int(max_dur * sr))
+            raw = wf.readframes(n)
+        fmt  = {1: "b", 2: "h", 4: "i"}.get(sw, "h")
+        data = np.array(struct.unpack(f"{len(raw)//sw}{fmt}", raw), dtype=np.float32)
+        if sw == 2: data /= 32768.0
+        elif sw == 1: data = (data - 128) / 128.0
+        if ch > 1: data = data.reshape(-1, ch).mean(axis=1)
+        return data, sr
     except Exception:
         pass
 
     raise RuntimeError(
-        f"Impossibile caricare {path}. "
-        "Su desktop installa 'soundfile' per supporto MP3."
+        f"Impossibile caricare {path}.\n"
+        "Su desktop: pip install soundfile"
     )
