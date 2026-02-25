@@ -52,37 +52,27 @@ jobs:
           pip install --upgrade pip wheel
           pip install buildozer==1.5.0 cython==0.29.37
 
-      - name: Installa Android SDK e crea symlink per buildozer
+      - name: Installa Android SDK
         run: |
           SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
           mkdir -p "$SDK_ROOT/cmdline-tools"
-
-          wget -q \
-            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
-            -O /tmp/cmdtools.zip
-          unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools-extracted
-          mv /tmp/cmdtools-extracted/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
-
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+               -O /tmp/cmdtools.zip
+          unzip -q /tmp/cmdtools.zip -d /tmp/ct
+          mv /tmp/ct/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
           SDKMGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-
           # Symlink percorso vecchio che buildozer cerca
           mkdir -p "$SDK_ROOT/tools/bin"
           ln -sf "$SDKMGR" "$SDK_ROOT/tools/bin/sdkmanager"
           chmod +x "$SDK_ROOT/tools/bin/sdkmanager"
-
           yes | "$SDKMGR" --sdk_root="$SDK_ROOT" --licenses 2>/dev/null || true
-
           "$SDKMGR" --sdk_root="$SDK_ROOT" \
-            "platforms;android-33" \
-            "build-tools;34.0.0" \
-            "platform-tools"
-
+            "platforms;android-33" "build-tools;34.0.0" "platform-tools"
           mkdir -p "$SDK_ROOT/licenses"
           printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" \
             > "$SDK_ROOT/licenses/android-sdk-license"
           printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
             > "$SDK_ROOT/licenses/android-sdk-preview-license"
-
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_HOME=$SDK_ROOT"     >> $GITHUB_ENV
           echo "$SDK_ROOT/tools/bin"                >> $GITHUB_PATH
@@ -91,11 +81,22 @@ jobs:
           echo "$SDK_ROOT/build-tools/34.0.0"       >> $GITHUB_PATH
 
       - name: Compila APK
-        run: |
-          buildozer -v android debug 2>&1 | tee build.log
-          echo "Exit code: $?"
+        run: buildozer -v android debug 2>&1 | tee build.log
 
-      # Sempre carica il log completo (successo O errore)
+      - name: Mostra errore reale (righe prima di ENVIRONMENT)
+        if: always()
+        run: |
+          ENV_LINE=$(grep -n "^# ENVIRONMENT:" build.log 2>/dev/null | head -1 | cut -d: -f1)
+          if [ -n "$ENV_LINE" ] && [ "$ENV_LINE" -gt 10 ]; then
+            START=$(( ENV_LINE - 250 ))
+            [ $START -lt 1 ] && START=1
+            echo "=== RIGHE $START-$ENV_LINE (prima di ENVIRONMENT) ==="
+            sed -n "${START},${ENV_LINE}p" build.log
+          else
+            echo "=== ULTIME 250 RIGHE ==="
+            tail -250 build.log
+          fi
+
       - name: Carica log completo
         if: always()
         uses: actions/upload-artifact@v4
@@ -104,33 +105,17 @@ jobs:
           path: build.log
           retention-days: 7
 
-      - name: Mostra errore reale (righe prima di ENVIRONMENT)
-        if: failure()
-        run: |
-          echo "=== ULTIME 200 RIGHE PRIMA DEL DUMP ENVIRONMENT ==="
-          # Trova la riga dove inizia ENVIRONMENT e mostra 200 righe prima
-          ENV_LINE=$(grep -n "^# ENVIRONMENT:" build.log | head -1 | cut -d: -f1)
-          if [ -n "$ENV_LINE" ] && [ "$ENV_LINE" -gt 10 ]; then
-            START=$(( ENV_LINE - 200 ))
-            [ $START -lt 1 ] && START=1
-            sed -n "${START},${ENV_LINE}p" build.log
-          else
-            # Nessun ENVIRONMENT trovato, mostra le ultime 200 righe normali
-            tail -200 build.log
-          fi
-
-      - name: Trova e verifica APK
+      - name: Trova APK
         id: find_apk
         run: |
           APK=$(find bin/ -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK" ]; then
-            echo "APK non trovato."
-            exit 1
+            echo "APK non trovato."; exit 1
           fi
           echo "apk_path=$APK" >> $GITHUB_OUTPUT
-          echo "APK trovato: $APK ($(du -h "$APK" | cut -f1))"
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
 
-      - name: Carica APK come artefatto
+      - name: Carica APK
         uses: actions/upload-artifact@v4
         with:
           name: MusicMoodAnalyzer-APK
