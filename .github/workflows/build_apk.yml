@@ -49,7 +49,7 @@ jobs:
       - name: Installa buildozer e Cython
         run: |
           pip install --upgrade pip wheel
-          pip install buildozer==1.5.0 cython==0.29.37
+          pip install buildozer==1.5.0 cython==3.0.11
 
       - name: Installa Android SDK
         run: |
