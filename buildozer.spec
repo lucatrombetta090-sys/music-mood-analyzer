@@ -31,7 +31,8 @@ android.permissions      = \
 
 android.features         = android.hardware.audio.output
 
-p4a.branch = develop
+# develop usa Python 3.14 (incompatibile con Kivy 2.3.0 - Py_UNICODE rimosso)
+p4a.branch = v2024.01.21
 
 [buildozer]
 log_level = 2
