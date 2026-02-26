@@ -1,38 +1,145 @@
-[app]
+name: Build APK
 
-title            = Music Mood Analyzer
-package.name     = musicmoodanalyzer
-package.domain   = com.example
-source.dir       = .
-source.include_exts = py,kv,json,txt,db
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
-version          = 2.0
+jobs:
+  build-apk:
+    name: Build Music Mood Analyzer APK
+    runs-on: ubuntu-22.04
 
-# scipy RIMOSSA — tutto DSP riscritto con numpy puro (dsp_features.py)
-# pyjnius per MediaCodec Android (decodifica MP3 nativa)
-requirements     = python3,kivy==2.3.0,numpy,pyjnius,mutagen,plyer,pillow
+    steps:
+      - name: Checkout codice
+        uses: actions/checkout@v4
 
-orientation      = portrait
+      - name: Configura Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
 
-android.minapi           = 24
-android.api              = 33
-# NDK 28c: obbligatorio per recipe fortran (dipendenza numpy/openblas)
-android.ndk              = 25b
-android.build_tools_version = 34.0.0
-android.archs            = arm64-v8a,armeabi-v7a
-android.allow_backup     = True
-android.accept_sdk_license = True
+      - name: Configura Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
 
-android.permissions      = \
-    READ_EXTERNAL_STORAGE,\
-    WRITE_EXTERNAL_STORAGE,\
-    READ_MEDIA_AUDIO,\
-    INTERNET
+      # Cache solo ~/.gradle e le recipe p4a già compilate (NON il bootstrap SDL2)
+      # v6: bust completo per eliminare artefatti NDK28c dalle build precedenti
+      - name: Cache buildozer
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer/android/platform/python-for-android
+            ~/.buildozer/android/platform/android-sdk
+            ~/.gradle
+          key: buildozer-v7-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-v7-${{ runner.os }}-
 
+      - name: Installa dipendenze sistema
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip wget ccache libffi-dev libssl-dev \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev cmake libltdl-dev \
+            libgdbm-dev libbz2-dev libsqlite3-dev lzma \
+            liblzma-dev libreadline-dev build-essential \
+            python3-pip python3-venv gfortran
 
-# develop usa Python 3.14 (incompatibile con Kivy 2.3.0 - Py_UNICODE rimosso)
-p4a.branch = v2024.01.21
+      - name: Installa buildozer e Cython
+        run: |
+          pip install --upgrade pip wheel
+          pip install buildozer==1.5.0 cython==3.0.11
 
-[buildozer]
-log_level = 2
-warn_on_root = 1
+      - name: Installa Android SDK
+        run: |
+          SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          if [ ! -d "$SDK_ROOT/platforms/android-33" ]; then
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+                 -O /tmp/cmdtools.zip
+            unzip -q /tmp/cmdtools.zip -d /tmp/ct
+            mv /tmp/ct/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+            SDKMGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+            mkdir -p "$SDK_ROOT/tools/bin"
+            ln -sf "$SDKMGR" "$SDK_ROOT/tools/bin/sdkmanager"
+            chmod +x "$SDK_ROOT/tools/bin/sdkmanager"
+            yes | "$SDKMGR" --sdk_root="$SDK_ROOT" --licenses 2>/dev/null || true
+            "$SDKMGR" --sdk_root="$SDK_ROOT" \
+              "platforms;android-33" "build-tools;34.0.0" "platform-tools"
+          fi
+          SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          mkdir -p "$SDK_ROOT/licenses"
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" \
+            > "$SDK_ROOT/licenses/android-sdk-license"
+          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
+            > "$SDK_ROOT/licenses/android-sdk-preview-license"
+          SDKMGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK_ROOT"     >> $GITHUB_ENV
+          echo "$SDK_ROOT/tools/bin"                >> $GITHUB_PATH
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$SDK_ROOT/platform-tools"           >> $GITHUB_PATH
+          echo "$SDK_ROOT/build-tools/34.0.0"       >> $GITHUB_PATH
+
+      - name: Installa NDK 25b (compatibile con p4a v2024.01.21 + SDL2)
+        run: |
+          NDK_DIR="$HOME/.buildozer/android/platform/android-ndk-r25b"
+          # Rimuovi NDK 28c se presente da build precedenti (causa il bug ALooper_pollAll)
+          rm -rf "$HOME/.buildozer/android/platform/android-ndk-r28c"
+          if [ ! -d "$NDK_DIR" ]; then
+            echo "Scarico NDK r25b..."
+            wget -q https://dl.google.com/android/repository/android-ndk-r25b-linux.zip \
+                 -O /tmp/ndk25b.zip
+            mkdir -p "$HOME/.buildozer/android/platform"
+            unzip -q /tmp/ndk25b.zip -d "$HOME/.buildozer/android/platform"
+            echo "NDK r25b installato"
+          else
+            echo "NDK r25b già presente"
+          fi
+          echo "ANDROIDNDK=$NDK_DIR" >> $GITHUB_ENV
+          echo "NDK usato: $(ls $NDK_DIR/toolchains | head -1)"
+
+      - name: Rimuovi artefatti build vecchi (NDK28c)
+        run: |
+          # Elimina i bootstrap builds che potrebbero avere percorsi NDK28c hardcoded
+          rm -rf "$HOME/.buildozer/android/platform/build-arm64-v8a_armeabi-v7a" 2>/dev/null || true
+          echo "Artefatti vecchi rimossi"
+
+      - name: Compila APK
+        run: buildozer -v android debug 2>&1 | tee build.log || true
+
+      - name: "[LEGGI QUI] Errore reale"
+        if: always()
+        run: |
+          ENV_LINE=$(grep -n "^# ENVIRONMENT:\|ENVIRONMENT:" build.log 2>/dev/null | head -1 | cut -d: -f1)
+          END=${ENV_LINE:-$(wc -l < build.log)}
+          START=$(( END - 80 ))
+          [ $START -lt 1 ] && START=1
+          echo "=== RIGHE $START-$END ==="
+          sed -n "${START},${END}p" build.log | cat
+
+      - name: Carica log completo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-completo
+          path: build.log
+          retention-days: 7
+
+      - name: Trova APK
+        id: find_apk
+        run: |
+          APK=$(find bin/ -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then echo "APK non trovato."; exit 1; fi
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+
+      - name: Carica APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicMoodAnalyzer-APK
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          retention-days: 30
