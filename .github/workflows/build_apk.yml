@@ -34,8 +34,8 @@ jobs:
             ~/.buildozer/android/platform/python-for-android
             ~/.buildozer/android/platform/android-sdk
             ~/.gradle
-          key: buildozer-v6-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-          restore-keys: buildozer-v6-${{ runner.os }}-
+          key: buildozer-v7-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-v7-${{ runner.os }}-
 
       - name: Installa dipendenze sistema
         run: |
