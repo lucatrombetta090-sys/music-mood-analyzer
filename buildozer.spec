@@ -29,7 +29,6 @@ android.permissions      = \
     READ_MEDIA_AUDIO,\
     INTERNET
 
-android.features         = android.hardware.audio.output
 
 # develop usa Python 3.14 (incompatibile con Kivy 2.3.0 - Py_UNICODE rimosso)
 p4a.branch = v2024.01.21
