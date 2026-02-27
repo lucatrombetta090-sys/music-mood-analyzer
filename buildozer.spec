@@ -10,7 +10,7 @@ version          = 2.0
 
 # scipy RIMOSSA — tutto DSP riscritto con numpy puro (dsp_features.py)
 # pyjnius per MediaCodec Android (decodifica MP3 nativa)
-requirements     = python3,kivy==2.3.0,numpy,pyjnius,mutagen,plyer,pillow
+requirements     = python3,kivy==2.3.0,numpy,pyjnius,android,mutagen,plyer,pillow
 
 orientation      = portrait
 
