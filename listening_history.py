@@ -12,6 +12,7 @@ Fornisce funzionalità di analisi:
 - Grafici temporali di evoluzione mood
 """
 
+import os
 import sqlite3
 import logging
 from datetime import datetime, timedelta
@@ -22,7 +23,16 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-DB_PATH = Path("listening_history.db")
+# Usa CWD (p4a lo imposta sulla dir privata dell'app, sempre scrivibile)
+# Con fallback su /tmp se CWD non è scrivibile
+def _db_path() -> Path:
+    cwd = Path.cwd()
+    if os.access(str(cwd), os.W_OK):
+        return cwd / "listening_history.db"
+    import tempfile
+    return Path(tempfile.gettempdir()) / "listening_history.db"
+
+DB_PATH = _db_path()
 
 
 # ===========================================================================
