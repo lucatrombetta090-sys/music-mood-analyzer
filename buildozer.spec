@@ -6,32 +6,35 @@ package.domain   = com.example
 source.dir       = .
 source.include_exts = py,kv,json,txt,db
 
-version          = 2.0
+version          = 2.1
 
-# scipy RIMOSSA — tutto DSP riscritto con numpy puro (dsp_features.py)
-# pyjnius per MediaCodec Android (decodifica MP3 nativa)
-requirements     = python3,kivy==2.3.0,numpy,pyjnius,android,mutagen,plyer,pillow
+# numpy pinned a 1.24.4 — l'ultima versione compatibile con p4a v2024.01.21
+# (numpy >= 1.25 causa "lapack_lite ld returned 1 exit status" sul build host)
+requirements     = python3,kivy==2.3.0,numpy==1.24.4,pyjnius,android,mutagen,plyer,pillow
 
 orientation      = portrait
 
-android.minapi           = 24
-android.api              = 33
-# NDK 28c: obbligatorio per recipe fortran (dipendenza numpy/openblas)
+# Android 16 (API 36) — targetapi deve essere >= 35 altrimenti il sistema
+# forza il compatibility mode e alcune API crashano.
+# minapi=21 copre il 99% dei dispositivi Android attivi.
+android.minapi           = 21
+android.api              = 35
 android.ndk              = 25b
 android.build_tools_version = 34.0.0
 android.archs            = arm64-v8a,armeabi-v7a
-android.allow_backup     = True
+android.allow_backup     = False
 android.accept_sdk_license = True
 
-android.permissions      = \
+# Permessi — MANAGE_EXTERNAL_STORAGE rimosso dal manifest:
+# su Android 11+ viene richiesto a runtime aprendo le Impostazioni,
+# dichiararlo nel manifest senza la meta-data corretta crasha l'app.
+android.permissions = \
     READ_EXTERNAL_STORAGE,\
     WRITE_EXTERNAL_STORAGE,\
     READ_MEDIA_AUDIO,\
-    MANAGE_EXTERNAL_STORAGE,\
+    READ_MEDIA_IMAGES,\
     INTERNET
 
-
-# develop usa Python 3.14 (incompatibile con Kivy 2.3.0 - Py_UNICODE rimosso)
 p4a.branch = v2024.01.21
 
 [buildozer]
