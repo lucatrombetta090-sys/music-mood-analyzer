@@ -1,11 +1,6 @@
 """
-analyze_mp3.py — Orchestrazione analisi audio (versione Android/scipy)
-
-Sostituisce librosa con:
-  audio_decode.py  → decodifica MP3 (MediaCodec su Android, soundfile su desktop)
-  dsp_features.py  → tutte le feature DSP (scipy/numpy puro)
-
-Logica di mood/genre/cache/scan invariata rispetto all'originale.
+analyze_mp3.py — Orchestrazione analisi audio (versione Android)
+Path e logging sicuri per Android: nessun FileHandler a livello modulo.
 """
 
 import os
@@ -18,24 +13,50 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from audio_decode  import load_audio
-from dsp_features  import extract_features as _dsp_extract
+from audio_decode import load_audio
+from dsp_features import extract_features as _dsp_extract
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("music_analyzer.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
+# ---------------------------------------------------------------------------
+# Path sicuro per Android (usa CWD che p4a imposta sulla dir dati dell'app)
+# ---------------------------------------------------------------------------
+def _get_data_dir() -> Path:
+    """Restituisce una directory scrivibile su qualsiasi piattaforma."""
+    # p4a imposta CWD sulla dir privata dell'app (/data/data/<pkg>/files/)
+    # che è sempre scrivibile. Su desktop usa la home.
+    cwd = Path.cwd()
+    if os.access(str(cwd), os.W_OK):
+        return cwd
+    # Fallback: directory temporanea
+    import tempfile
+    return Path(tempfile.gettempdir())
+
+DATA_DIR   = _get_data_dir()
+CACHE_FILE = DATA_DIR / "music_cache.json"
+LOG_FILE   = DATA_DIR / "music_analyzer.log"
+
+# ---------------------------------------------------------------------------
+# Logging — FileHandler solo se la directory è scrivibile (mai a livello modulo!)
+# ---------------------------------------------------------------------------
+def _setup_logging():
+    handlers = [logging.StreamHandler()]
+    try:
+        handlers.append(logging.FileHandler(str(LOG_FILE), encoding="utf-8"))
+    except Exception:
+        pass  # Non crashare se il file non è apribile
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+_setup_logging()
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cache
 # ─────────────────────────────────────────────────────────────────────────────
-CACHE_FILE    = Path("music_cache.json")
-_CACHE_VERSION = 6  # incrementato per scipy rewrite
+_CACHE_VERSION = 6
 
 _FEATURE_DEFAULTS = {
     "rms_std": 0.01, "dynamic_range": 3.0,
@@ -49,10 +70,10 @@ def _load_cache() -> dict:
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning("Cache corrotta: %s", e); return {}
+    except Exception as e:
+        log.warning("Cache corrotta: %s", e)
+        return {}
     if data.get("__version__") != _CACHE_VERSION:
-        log.info("Cache versione diversa — rigenerazione.")
         return {"__version__": _CACHE_VERSION}
     return data
 
@@ -62,7 +83,7 @@ def _save_cache(cache: dict):
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
-    except OSError as e:
+    except Exception as e:
         log.warning("Impossibile salvare cache: %s", e)
 
 
@@ -83,7 +104,7 @@ def _file_hash(filepath: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point pubblico — extract_features (delega a dsp_features)
+# Feature extraction
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_features(filepath: str) -> dict:
     y, sr = load_audio(filepath, duration=90.0)
@@ -91,7 +112,7 @@ def extract_features(filepath: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mood — Valence / Arousal  (codice identico all'originale)
+# Mood
 # ─────────────────────────────────────────────────────────────────────────────
 def _safe_float(x, default=0.0):
     try:
@@ -123,7 +144,6 @@ def _norm_abs(value, key):
 def compute_mood(features_list: list) -> list:
     if not features_list:
         return features_list
-
     raw_a_list, raw_v_list = [], []
     for f in features_list:
         t_n  = _norm_abs(f["tempo"],      "tempo")
@@ -132,21 +152,17 @@ def compute_mood(features_list: list) -> list:
         c_n  = _norm_abs(f["centroid"],   "centroid")
         z_n  = _norm_abs(f["zcr"],        "zcr")
         ch_n = _norm_abs(f["chroma_std"], "chroma_std")
-
         raw_a = 0.30*r_n + 0.25*o_n + 0.20*t_n + 0.15*z_n + 0.10*c_n
         mode_scaled = f["mode_major"]*2.0 - 1.0
-        mode_w      = 0.35 * f.get("mode_strength", 0.5)
+        mode_w = 0.35 * f.get("mode_strength", 0.5)
         raw_v = (mode_scaled*(0.30+mode_w) + 0.20*c_n + 0.15*t_n
                  + 0.10*r_n - 0.10*ch_n)
-
         raw_a_list.append(raw_a)
         raw_v_list.append(raw_v)
-
     a_off = float(np.nanmedian(raw_a_list)) * 0.4
     v_off = float(np.nanmedian(raw_v_list)) * 0.4
     if np.isnan(a_off): a_off = 0.0
     if np.isnan(v_off): v_off = 0.0
-
     results = []
     for i, f in enumerate(features_list):
         results.append({
@@ -165,19 +181,16 @@ def assign_mood(data: list) -> list:
     a_thresh = float(np.clip(np.nanmedian(arousals), 0.40, 0.60))
     if np.isnan(v_thresh): v_thresh = 0.5
     if np.isnan(a_thresh): a_thresh = 0.5
-
     _Q = {(True,True):"Energetic", (True,False):"Positive",
           (False,True):"Aggressive", (False,False):"Melancholic"}
     vm, am = 0.05, 0.05
-
     for d in data:
         v, a = d["valence"], d["arousal"]
         if   v >= v_thresh+vm and a >= a_thresh+am: d["mood"] = "Energetic"
         elif v >= v_thresh+vm and a <  a_thresh-am: d["mood"] = "Positive"
         elif v <  v_thresh-vm and a >= a_thresh+am: d["mood"] = "Aggressive"
         elif v <  v_thresh-vm and a <  a_thresh-am: d["mood"] = "Melancholic"
-        else:                                        d["mood"] = _Q[(v>=v_thresh, a>=a_thresh)]
-
+        else: d["mood"] = _Q[(v>=v_thresh, a>=a_thresh)]
         dist = ((v-v_thresh)**2 + (a-a_thresh)**2)**0.5
         d["mood_confidence"] = round(float(np.clip(dist/0.707, 0, 1)), 3)
         vs, as_ = v >= v_thresh, a >= a_thresh
@@ -187,7 +200,7 @@ def assign_mood(data: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Genre (identico all'originale)
+# Genre
 # ─────────────────────────────────────────────────────────────────────────────
 def _sigmoid(x, center, steepness=5.0):
     arg = float(np.clip(-steepness*(x-center), -30, 30))
@@ -198,19 +211,19 @@ def _bell(x, center, width):
     return float(np.exp(-0.5*z*z))
 
 def _compute_ds(data):
-    def med(k):  return float(np.nanmedian([d[k] for d in data]))
+    def med(k): return float(np.nanmedian([d[k] for d in data]))
     def std(k):
         vals = np.array([d[k] for d in data], dtype=float)
-        q75,q25 = np.nanpercentile(vals,[75,25])
+        q75, q25 = np.nanpercentile(vals, [75, 25])
         return float(max((q75-q25)/1.349, 1e-9))
     return {
-        "med_rms": med("rms"),         "std_rms": std("rms"),
+        "med_rms": med("rms"),          "std_rms": std("rms"),
         "med_centroid": med("centroid"),"std_centroid": std("centroid"),
         "med_bandwidth": med("bandwidth"),"std_bandwidth": std("bandwidth"),
         "med_zcr": med("zcr"),          "std_zcr": std("zcr"),
         "med_onset_mean": med("onset_mean"),"std_onset_mean": std("onset_mean"),
         "med_onset_std": med("onset_std"), "std_onset_std": std("onset_std"),
-        "med_tempo": med("tempo"),       "std_tempo": std("tempo"),
+        "med_tempo": med("tempo"),      "std_tempo": std("tempo"),
         "med_dynrange": med("dynamic_range"),"std_dynrange": std("dynamic_range"),
         "med_chroma_std": med("chroma_std"),"std_chroma_std": std("chroma_std"),
         "med_contrast": float(np.nanmedian(
@@ -256,8 +269,8 @@ def assign_genre(data: list) -> list:
     for d in data:
         scores  = {k: float(np.clip(v,0,1)) for k,v in _score_genre(d,ds).items()}
         sorted_ = sorted(scores.items(), key=lambda x:x[1], reverse=True)
-        best, bscore  = sorted_[0]
-        sec,  sscore  = sorted_[1]
+        best, bscore = sorted_[0]
+        sec,  sscore = sorted_[1]
         d["genre"]            = best
         d["genre_scores"]     = {k: round(v,3) for k,v in scores.items()}
         d["genre_confidence"] = round(bscore - sscore, 3)
@@ -272,7 +285,7 @@ def _extract_year(filepath: str) -> Optional[int]:
     try:
         import re
         from mutagen.easyid3 import EasyID3
-        from mutagen.mp3     import MP3
+        from mutagen.mp3 import MP3
         try:
             audio = EasyID3(filepath)
             if "date" in audio:
@@ -287,17 +300,13 @@ def _extract_year(filepath: str) -> Optional[int]:
                 if m: return int(m.group())
         except Exception:
             pass
-        m = re.search(r"(?:ANNO\s*)?(\d{4})", filepath)
-        if m:
-            y = int(m.group(1))
-            if 1950 <= y <= 2030: return y
     except Exception:
         pass
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# scan_folders — API pubblica (identica all'originale)
+# scan_folders
 # ─────────────────────────────────────────────────────────────────────────────
 def scan_folders(folder_paths: list,
                  progress_callback: Optional[Callable] = None) -> list:
@@ -340,7 +349,7 @@ def scan_folders(folder_paths: list,
                                 "year": _extract_year(full_path)})
             log.info("Analizzato [%d/%d]: %s", idx+1, total, filename)
         except Exception:
-            log.error("Errore analizzando %s:\n%s", full_path, traceback.format_exc())
+            log.error("Errore %s:\n%s", full_path, traceback.format_exc())
 
     _save_cache(cache)
     log.info("Scansione: %d brani (%d cache, %d nuovi).",
@@ -349,7 +358,7 @@ def scan_folders(folder_paths: list,
     if not raw_features:
         return []
 
-    enriched   = compute_mood(raw_features)
+    enriched = compute_mood(raw_features)
     for i in range(len(enriched)):
         songs_meta[i].update(enriched[i])
     songs_meta = assign_mood(songs_meta)
