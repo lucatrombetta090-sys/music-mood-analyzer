@@ -27,6 +27,7 @@ android.permissions      = \
     READ_EXTERNAL_STORAGE,\
     WRITE_EXTERNAL_STORAGE,\
     READ_MEDIA_AUDIO,\
+    MANAGE_EXTERNAL_STORAGE,\
     INTERNET
 
 
