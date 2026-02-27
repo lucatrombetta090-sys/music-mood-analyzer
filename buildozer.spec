@@ -8,12 +8,9 @@ source.include_exts = py,kv,json,txt,db
 
 version          = 2.1
 
-# numpy senza pin versione — la versione è gestita dal recipe locale in ./recipes/numpy/
-# Il recipe locale corregge l'URL (pypi.python.org è deprecato → files.pythonhosted.org)
+# NO p4a.local_recipes — il file __init__.py nella root rompeva tutti gli import.
+# Il fix numpy URL è gestito direttamente nel workflow GitHub Actions.
 requirements     = python3,kivy==2.3.0,numpy,pyjnius,android,mutagen,plyer,pillow
-
-# Percorso recipe personalizzati (override URL numpy)
-p4a.local_recipes = ./recipes
 
 orientation      = portrait
 
