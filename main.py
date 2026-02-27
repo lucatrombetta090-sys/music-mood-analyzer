@@ -1,22 +1,48 @@
 """
-Music Mood Analyzer v18
-Fixes:
-  - Richiesta permessi runtime (Android 6+)
-  - Gestione MANAGE_EXTERNAL_STORAGE (Android 11+)
-  - Rimossi emoji → testo plain (compatibile con tutti i font Android)
-  - UI migliorata con etichette chiare
+Music Mood Analyzer v19 — Fix Android 16 crash
+===============================================
+Fix applicati:
+  - Rimosso Config.set width/height (causava crash all'avvio su Android)
+  - Permessi runtime robusti, compatibili Android 6-16
+  - MANAGE_EXTERNAL_STORAGE via Settings (non nel manifest)
+  - Gestione errori all'avvio con log su file
+  - targetApi 35 (Android 16 compatibile)
+  - numpy==1.24.4 (fix build lapack)
 """
 
 import os
+import sys
 import threading
 import random
 
+# Log di avvio su file — aiuta a diagnosticare crash Android
+_LOG_PATH = None
+try:
+    _LOG_PATH = "/sdcard/musicmood_startup.log"
+    with open(_LOG_PATH, "w") as _f:
+        _f.write("Avvio app...\n")
+except Exception:
+    _LOG_PATH = None
+
+def _log(msg):
+    print(msg)
+    if _LOG_PATH:
+        try:
+            with open(_LOG_PATH, "a") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+_log("Import kivy...")
+
 import kivy
 kivy.require("2.3.0")
+_log("kivy OK")
 
+# NON impostare Config width/height — su Android determina il display system,
+# forzarlo causa un crash immediato su Android 16+
 from kivy.config import Config
-Config.set("graphics", "width",  "400")
-Config.set("graphics", "height", "750")
+Config.set("kivy", "log_enable", "1")
 
 from kivy.app               import App
 from kivy.uix.screenmanager import ScreenManager, Screen, FadeTransition
@@ -39,19 +65,40 @@ from kivy.properties        import NumericProperty, BooleanProperty
 from kivy.graphics          import Color, RoundedRectangle, Rectangle
 from kivy.utils             import get_color_from_hex
 
-import listening_history as lh
-from analyze_mp3 import scan_folders
+_log("kivy UI imports OK")
 
-lh.init_database()
+# Moduli app
+try:
+    import listening_history as lh
+    from analyze_mp3 import scan_folders
+    _log("app modules OK")
+except Exception as e:
+    _log(f"ERRORE import app modules: {e}")
+    raise
+
+try:
+    lh.init_database()
+    _log("database OK")
+except Exception as e:
+    _log(f"ERRORE database: {e}")
 
 # ── Rilevamento Android ───────────────────────────────────────────────────────
+ANDROID = False
+_android_ver = 0
 try:
-    from android.permissions import (
-        request_permissions, check_permission, Permission
-    )
+    from android.permissions import request_permissions, check_permission, Permission
     from jnius import autoclass
     ANDROID = True
+    try:
+        Build = autoclass("android.os.Build$VERSION")
+        _android_ver = Build.SDK_INT
+    except Exception:
+        _android_ver = 0
+    _log(f"Android rilevato, API={_android_ver}")
 except ImportError:
+    _log("Non Android (desktop mode)")
+except Exception as e:
+    _log(f"Android import parziale: {e}")
     ANDROID = False
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -82,10 +129,10 @@ MOOD_COLORS = {
     "Melancholic":C["melancholic"],
 }
 MOOD_TAG = {
-    "Energetic": "ENERG",
-    "Positive":  "POS",
-    "Aggressive":"AGGR",
-    "Melancholic":"MEL",
+    "Energetic": "ENERGETIC",
+    "Positive":  "POSITIVE",
+    "Aggressive":"AGGRESSIVE",
+    "Melancholic":"MELANCHOLY",
 }
 MOODS  = ["Energetic","Positive","Aggressive","Melancholic"]
 GENRES = ["Pop","Rock","Electronic","HipHop","Acoustic","Jazz","Classical"]
@@ -95,68 +142,85 @@ def hc(h, a=1.0):
     return (c[0], c[1], c[2], a)
 
 def _fmt(s):
-    s = int(s)
+    s = max(0, int(s))
     return f"{s//60}:{s%60:02d}"
 
 
-# ── Permessi runtime ──────────────────────────────────────────────────────────
-_perm_granted = False
+# ── Permessi storage ──────────────────────────────────────────────────────────
+_perm_granted = not ANDROID
+
+def _get_permissions_list():
+    """Permessi appropriati per versione Android."""
+    perms = []
+    if not ANDROID:
+        return perms
+    try:
+        perms.append(Permission.READ_EXTERNAL_STORAGE)
+        perms.append(Permission.WRITE_EXTERNAL_STORAGE)
+        # Android 13+ (API 33): READ_MEDIA_AUDIO
+        if _android_ver >= 33:
+            try:
+                perms.append("android.permission.READ_MEDIA_AUDIO")
+            except Exception:
+                pass
+    except Exception as e:
+        _log(f"[perm] errore lista permessi: {e}")
+    return perms
+
 
 def _request_storage_permissions(callback=None):
-    """Richiede READ/WRITE_EXTERNAL_STORAGE a runtime (Android 6+)."""
+    """Richiede permessi storage a runtime — sicuro su tutte le versioni Android."""
     global _perm_granted
     if not ANDROID:
         _perm_granted = True
         if callback: callback(True)
         return
 
-    # Android 11+ (API 30): serve MANAGE_EXTERNAL_STORAGE via Settings
-    try:
-        Build = autoclass("android.os.Build$VERSION")
-        if Build.SDK_INT >= 30:
+    # Android 11+ (API 30): apri Settings per MANAGE_EXTERNAL_STORAGE
+    if _android_ver >= 30:
+        try:
             Environment = autoclass("android.os.Environment")
             if not Environment.isExternalStorageManager():
                 _open_all_files_settings()
-                # Non possiamo sapere se l'utente ha accettato, continuiamo con i permessi base
-    except Exception as e:
-        print(f"[perm] Android 11 check error: {e}")
+        except Exception as e:
+            _log(f"[perm] Android 11+ check: {e}")
 
-    perms = [
-        Permission.READ_EXTERNAL_STORAGE,
-        Permission.WRITE_EXTERNAL_STORAGE,
-    ]
-    # Aggiunge READ_MEDIA_AUDIO per Android 13+
-    try:
-        perm_media = autoclass("android.Manifest$permission")
-        if hasattr(perm_media, "READ_MEDIA_AUDIO"):
-            perms.append("android.permission.READ_MEDIA_AUDIO")
-    except Exception:
-        pass
+    perms = _get_permissions_list()
+    if not perms:
+        _perm_granted = True
+        if callback: callback(True)
+        return
 
     def _on_result(permissions, results):
         global _perm_granted
-        _perm_granted = all(results)
-        print(f"[perm] granted={_perm_granted} {list(zip(permissions,results))}")
+        _perm_granted = any(results)  # basta almeno uno
+        _log(f"[perm] granted={_perm_granted}")
         if callback:
             Clock.schedule_once(lambda dt: callback(_perm_granted), 0)
 
-    request_permissions(perms, _on_result)
+    try:
+        request_permissions(perms, _on_result)
+    except Exception as e:
+        _log(f"[perm] request_permissions error: {e}")
+        _perm_granted = False
+        if callback: Clock.schedule_once(lambda dt: callback(False), 0)
 
 
 def _open_all_files_settings():
-    """Apre la pagina Impostazioni per MANAGE_EXTERNAL_STORAGE (Android 11+)."""
+    """Apre la pagina Impostazioni per MANAGE_EXTERNAL_STORAGE."""
     try:
-        Intent  = autoclass("android.content.Intent")
-        Settings= autoclass("android.provider.Settings")
-        Uri     = autoclass("android.net.Uri")
+        Intent   = autoclass("android.content.Intent")
+        Settings = autoclass("android.provider.Settings")
+        Uri      = autoclass("android.net.Uri")
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         ctx = PythonActivity.mActivity
         pkg = ctx.getPackageName()
         intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
         intent.setData(Uri.parse(f"package:{pkg}"))
         ctx.startActivity(intent)
+        _log("[perm] Settings aperti")
     except Exception as e:
-        print(f"[perm] open settings error: {e}")
+        _log(f"[perm] open settings error: {e}")
 
 
 # ── Cerca cartelle Music ──────────────────────────────────────────────────────
@@ -173,7 +237,7 @@ def _find_music_dirs() -> list:
     try:
         for s in os.listdir("/storage"):
             p = f"/storage/{s}"
-            if s not in ("emulated", "self") and os.path.isdir(p):
+            if s not in ("emulated","self") and os.path.isdir(p):
                 roots += [p, f"{p}/Music"]
     except Exception:
         pass
@@ -228,7 +292,7 @@ class AppState:
     def fire(self,ev,*a):
         for fn in self._cbs.get(ev,[]):
             try: fn(*a)
-            except Exception as e: print(f"[cb]{ev}:{e}")
+            except Exception as e: _log(f"[cb]{ev}:{e}")
 
     def _stop(self):
         if self._sound:
@@ -238,22 +302,24 @@ class AppState:
 
     def play(self, song):
         self._stop()
-        s = SoundLoader.load(song["path"])
-        if not s: return
-        self._sound=s; self._sound.volume=self._volume
-        self._sound.bind(on_stop=self._ended)
-        self._sound.play(); self.current_song=song
-        lh.log_play(song); self.fire("song",song)
+        try:
+            s = SoundLoader.load(song["path"])
+            if not s:
+                _log(f"[audio] Cannot load {song['path']}")
+                return
+            self._sound=s; self._sound.volume=self._volume
+            self._sound.bind(on_stop=self._ended)
+            self._sound.play(); self.current_song=song
+            lh.log_play(song); self.fire("song",song)
+        except Exception as e:
+            _log(f"[audio] play error: {e}")
 
     def _ended(self,*_):
-        if self._loop and self.current_song:
-            self.play(self.current_song); return
+        if self._loop and self.current_song: self.play(self.current_song); return
         if self.current_playlist:
             nxt=(self.playlist_index+1)%len(self.current_playlist)
-            if nxt==0 and not self._loop:
-                self.current_song=None; self.fire("song",None)
-            else:
-                self.playlist_index=nxt; self.play(self.current_playlist[nxt])
+            if nxt==0 and not self._loop: self.current_song=None; self.fire("song",None)
+            else: self.playlist_index=nxt; self.play(self.current_playlist[nxt])
 
     def toggle_pause(self):
         if not self._sound: return
@@ -294,7 +360,9 @@ class AppState:
         return self._sound is not None and self._sound.state=="play"
 
     def position(self):
-        if self._sound: return self._sound.get_pos() or 0.0, self._sound.length or 0.0
+        if self._sound:
+            try: return self._sound.get_pos() or 0.0, self._sound.length or 0.0
+            except: pass
         return 0.0, 0.0
 
 
@@ -304,17 +372,7 @@ state = AppState()
 # =============================================================================
 # UI helpers
 # =============================================================================
-def mk_label(text, size=13, bold=False, color=None, halign="left",
-             sh_y=None, height=None):
-    kw = dict(text=text, font_size=sp(size), bold=bold,
-              color=hc(color or C["text"]), halign=halign)
-    if sh_y is not None: kw["size_hint_y"] = sh_y
-    if height is not None: kw["height"] = dp(height)
-    return Label(**kw)
-
-
 class RndRect(BoxLayout):
-    """BoxLayout con sfondo arrotondato."""
     def __init__(self, bg=None, radius=8, **kw):
         super().__init__(**kw)
         self._bg_col = hc(bg or C["card"])
@@ -330,23 +388,17 @@ class RndRect(BoxLayout):
 class DkBtn(Button):
     def __init__(self, bg=None, radius=8, **kw):
         super().__init__(**kw)
-        self._bg  = bg or hc(C["primary"])
-        self._r   = radius
-        self.background_normal = ""
-        self.background_color  = [0,0,0,0]
-        self.color = hc(C["text"])
-        self.font_size = sp(13)
+        self._bg = bg or hc(C["primary"])
+        self.background_normal=""; self.background_color=[0,0,0,0]
+        self.color=hc(C["text"]); self.font_size=sp(13)
         self._draw()
-        self.bind(pos=lambda *_: self._draw(), size=lambda *_: self._draw())
-
+        self.bind(pos=lambda *_:self._draw(), size=lambda *_:self._draw())
     def _draw(self):
         self.canvas.before.clear()
         with self.canvas.before:
             Color(*self._bg)
-            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(self._r)])
-
-    def set_bg(self, c):
-        self._bg = c; self._draw()
+            RoundedRectangle(pos=self.pos,size=self.size,radius=[dp(8)])
+    def set_bg(self,c): self._bg=c; self._draw()
 
 
 # =============================================================================
@@ -358,99 +410,51 @@ class SongRow(RecycleDataViewBehavior, BoxLayout):
 
     def __init__(self, **kw):
         super().__init__(**kw)
-        self.orientation = "vertical"
-        self.padding = [dp(14), dp(6)]
-        self.spacing = dp(2)
-        self.size_hint_y = None
-        self.height = dp(70)
-        self._song = None
-        self.t = Label(font_size=sp(13), bold=True, color=hc(C["text"]),
-                       halign="left", valign="middle",
-                       size_hint_y=None, height=dp(22))
-        self.m = Label(font_size=sp(11), color=hc(C["subtext"]),
-                       halign="left", valign="middle",
-                       size_hint_y=None, height=dp(18))
+        self.orientation="vertical"; self.padding=[dp(14),dp(6)]
+        self.spacing=dp(2); self.size_hint_y=None; self.height=dp(70); self._song=None
+        self.t=Label(font_size=sp(13),bold=True,color=hc(C["text"]),
+                     halign="left",valign="middle",size_hint_y=None,height=dp(22))
+        self.m=Label(font_size=sp(11),color=hc(C["subtext"]),
+                     halign="left",valign="middle",size_hint_y=None,height=dp(18))
         self.add_widget(self.t); self.add_widget(self.m)
         self.bind(pos=self._rd, size=self._rd)
 
-    def _rd(self, *_):
+    def _rd(self,*_):
         self.canvas.before.clear()
         with self.canvas.before:
-            if self.selected:
-                Color(*hc(C["primary"], 0.35))
-            else:
-                Color(*hc(C["card"]))
-            RoundedRectangle(
-                pos=(self.x+dp(4), self.y+dp(2)),
-                size=(self.width-dp(8), self.height-dp(4)),
-                radius=[dp(10)]
-            )
+            if self.selected: Color(*hc(C["primary"],0.35))
+            else: Color(*hc(C["card"]))
+            RoundedRectangle(pos=(self.x+dp(4),self.y+dp(2)),
+                             size=(self.width-dp(8),self.height-dp(4)),radius=[dp(10)])
 
-    def refresh_view_attrs(self, rv, index, data):
-        self.index = index
-        self._song = data.get("song", {})
-        self.selected = data.get("selected", False)
-        s = self._song
-        mood = s.get("mood", "")
-        title = s.get("title", "?")
-        if title.lower().endswith(".mp3"): title = title[:-4]
-        if len(title) > 38: title = title[:38] + "..."
-
-        genre = s.get("genre", "?")
-        if s.get("genre_alt"): genre += "/" + s["genre_alt"]
-        tag = MOOD_TAG.get(mood, mood[:5].upper() if mood else "")
-        mood_col = MOOD_COLORS.get(mood, C["subtext"])
-
-        self.t.text = f"[{tag}] {title}"
-        self.t.color = hc(mood_col)
-        self.m.text = f"{genre}  |  {s.get('tempo',0):.0f} BPM  |  {mood or '---'}"
+    def refresh_view_attrs(self,rv,index,data):
+        self.index=index; self._song=data.get("song",{}); self.selected=data.get("selected",False)
+        s=self._song; mood=s.get("mood","")
+        title=s.get("title","?")
+        if title.lower().endswith(".mp3"): title=title[:-4]
+        if len(title)>36: title=title[:36]+"..."
+        genre=s.get("genre","?")
+        if s.get("genre_alt"): genre+="/"+s["genre_alt"]
+        tag=MOOD_TAG.get(mood,mood[:6].upper() if mood else "")
+        self.t.text=f"[{tag}] {title}"
+        self.t.color=hc(MOOD_COLORS.get(mood,C["text"]))
+        self.m.text=f"{genre}  |  {s.get('tempo',0):.0f} BPM  |  {mood or '---'}"
         self._rd()
-        return super().refresh_view_attrs(rv, index, data)
+        return super().refresh_view_attrs(rv,index,data)
 
-    def on_touch_down(self, touch):
+    def on_touch_down(self,touch):
         if self.collide_point(*touch.pos) and self._song:
-            App.get_running_app().on_song_tap(self._song)
-            return True
+            App.get_running_app().on_song_tap(self._song); return True
         return super().on_touch_down(touch)
 
 
 class SongRV(RecycleView):
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        self.viewclass = "SongRow"
-        self.data = []
+    def __init__(self,**kw):
+        super().__init__(**kw); self.viewclass="SongRow"; self.data=[]
         with self.canvas.before:
-            Color(*hc(C["bg"]))
-            self._bg = Rectangle(pos=self.pos, size=self.size)
-        self.bind(pos=lambda *_: setattr(self._bg,"pos",self.pos),
-                  size=lambda *_: setattr(self._bg,"size",self.size))
-
-
-# =============================================================================
-# Banner permessi
-# =============================================================================
-class PermBanner(RndRect):
-    def __init__(self, on_grant, **kw):
-        super().__init__(bg=C["warn"], radius=10,
-                         size_hint_y=None, height=dp(68),
-                         spacing=dp(8), padding=[dp(12),dp(6)], **kw)
-        self._cb = on_grant
-        info = BoxLayout(orientation="vertical", size_hint_x=0.72)
-        info.add_widget(Label(
-            text="Accesso storage non concesso",
-            font_size=sp(12), bold=True, color=hc("#FFF"),
-            halign="left", size_hint_y=None, height=dp(22)))
-        info.add_widget(Label(
-            text="Tocca per abilitare lettura file",
-            font_size=sp(10), color=hc("#FFE"), halign="left",
-            size_hint_y=None, height=dp(18)))
-        btn = DkBtn(text="Abilita", size_hint_x=0.28,
-                    bg=hc(C["success"]), font_size=sp(12))
-        btn.bind(on_press=lambda *_: _request_storage_permissions(self._on_result))
-        self.add_widget(info); self.add_widget(btn)
-
-    def _on_result(self, ok):
-        self._cb(ok)
+            Color(*hc(C["bg"])); self._bg=Rectangle(pos=self.pos,size=self.size)
+        self.bind(pos=lambda *_:setattr(self._bg,"pos",self.pos),
+                  size=lambda *_:setattr(self._bg,"size",self.size))
 
 
 # =============================================================================
@@ -459,66 +463,45 @@ class PermBanner(RndRect):
 class FolderPickerPopup(Popup):
     def __init__(self, on_folder_selected, **kw):
         self._cb = on_folder_selected
-        content = BoxLayout(orientation="vertical", spacing=dp(8),
-                            padding=[dp(10), dp(8)])
+        content = BoxLayout(orientation="vertical", spacing=dp(8), padding=[dp(10),dp(8)])
 
-        # Istruzioni
-        info_box = RndRect(bg=C["card2"], radius=8,
-                           size_hint_y=None, height=dp(52),
-                           padding=[dp(10), dp(6)])
-        info_box.add_widget(Label(
-            text="Seleziona la cartella con i tuoi MP3.\n"
-                 "Le cartelle trovate sul dispositivo appaiono qui sotto.",
-            font_size=sp(11), color=hc(C["subtext"]),
-            halign="center", text_size=(dp(300), None)))
-        content.add_widget(info_box)
+        content.add_widget(Label(
+            text="Seleziona cartella con i tuoi MP3:",
+            font_size=sp(13), color=hc(C["text"]), size_hint_y=None, height=dp(28)))
 
-        # Lista cartelle
-        scroll = ScrollView(size_hint=(1, 1))
-        self._grid = GridLayout(cols=1, spacing=dp(6),
-                                size_hint_y=None, padding=[0, dp(4)])
+        scroll = ScrollView(size_hint=(1,1))
+        self._grid = GridLayout(cols=1, spacing=dp(6), size_hint_y=None, padding=[0,dp(4)])
         self._grid.bind(minimum_height=self._grid.setter("height"))
-        scroll.add_widget(self._grid)
-        content.add_widget(scroll)
+        scroll.add_widget(self._grid); content.add_widget(scroll)
 
-        # Percorso manuale
-        sep = Label(text="--- oppure inserisci percorso manuale ---",
-                    font_size=sp(10), color=hc(C["subtext"]),
-                    size_hint_y=None, height=dp(22))
-        content.add_widget(sep)
+        content.add_widget(Label(
+            text="--- o inserisci percorso manuale ---",
+            font_size=sp(10), color=hc(C["subtext"]), size_hint_y=None, height=dp(22)))
 
         path_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
         self._inp = TextInput(
             hint_text="/storage/emulated/0/Music",
-            background_color=hc(C["card"]),
-            foreground_color=hc(C["text"]),
-            hint_text_color=hc(C["subtext"]),
-            font_size=sp(11), multiline=False,
-            size_hint_x=0.70, padding=[dp(8), dp(10)])
+            background_color=hc(C["card"]), foreground_color=hc(C["text"]),
+            hint_text_color=hc(C["subtext"]), font_size=sp(11),
+            multiline=False, size_hint_x=0.70, padding=[dp(8),dp(10)])
         go = DkBtn(text="Vai", size_hint_x=0.30, bg=hc(C["primary"]))
         go.bind(on_press=self._custom)
         path_row.add_widget(self._inp); path_row.add_widget(go)
         content.add_widget(path_row)
 
-        cancel = DkBtn(text="Annulla", size_hint_y=None, height=dp(40),
-                       bg=hc(C["card"]))
+        cancel = DkBtn(text="Annulla", size_hint_y=None, height=dp(40), bg=hc(C["card"]))
         cancel.bind(on_press=self.dismiss)
         content.add_widget(cancel)
 
-        super().__init__(
-            title="Scegli cartella Music",
-            content=content,
-            size_hint=(0.93, 0.80),
-            background_color=hc(C["surface"]),
-            title_color=hc(C["text"]),
-            **kw
-        )
+        super().__init__(title="Scegli cartella", content=content,
+                         size_hint=(0.93,0.80),
+                         background_color=hc(C["surface"]),
+                         title_color=hc(C["text"]), **kw)
 
-        self._loading = Label(
+        self._grid.add_widget(Label(
             text="Cerco cartelle con MP3...",
             font_size=sp(12), color=hc(C["subtext"]),
-            size_hint_y=None, height=dp(40))
-        self._grid.add_widget(self._loading)
+            size_hint_y=None, height=dp(40)))
         threading.Thread(target=self._find, daemon=True).start()
 
     def _find(self):
@@ -528,45 +511,32 @@ class FolderPickerPopup(Popup):
     def _show(self, dirs):
         self._grid.clear_widgets()
         if not dirs:
-            msg = RndRect(bg=C["card2"], radius=8,
-                          size_hint_y=None, height=dp(80),
-                          padding=[dp(12), dp(10)])
-            msg.add_widget(Label(
-                text="Nessuna cartella MP3 trovata.\n\n"
-                     "Verifica i permessi storage nelle\n"
-                     "Impostazioni > App > Music Mood Analyzer\n"
-                     "oppure inserisci il percorso manualmente.",
+            self._grid.add_widget(Label(
+                text="Nessuna cartella MP3 trovata.\n"
+                     "Verifica i permessi storage:\n"
+                     "Impostazioni > App > Music Mood\n"
+                     "> Autorizzazioni > File\n"
+                     "oppure inserisci il percorso sotto.",
                 font_size=sp(11), color=hc(C["subtext"]),
-                halign="center", text_size=(dp(280), None)))
-            self._grid.add_widget(msg)
+                size_hint_y=None, height=dp(90), halign="center"))
             return
-
         for path, count in dirs:
-            row = RndRect(bg=C["card"], radius=10,
-                          size_hint_y=None, height=dp(60),
-                          spacing=dp(8), padding=[dp(10), dp(6)])
+            row = RndRect(bg=C["card"], radius=10, size_hint_y=None, height=dp(60),
+                          spacing=dp(8), padding=[dp(10),dp(6)])
             info = BoxLayout(orientation="vertical", size_hint_x=0.70)
-            # Abbrevia percorso
-            short = (path
-                     .replace("/storage/emulated/0", "[INT]")
-                     .replace("/sdcard", "[INT]"))
-            info.add_widget(Label(
-                text=short, font_size=sp(11), bold=True,
-                color=hc(C["text"]), halign="left",
-                size_hint_y=None, height=dp(24)))
-            info.add_widget(Label(
-                text=f"{count} file MP3", font_size=sp(10),
-                color=hc(C["accent"]), halign="left",
-                size_hint_y=None, height=dp(20)))
-            btn = DkBtn(text="Seleziona", size_hint_x=0.30,
-                        bg=hc(C["primary"]), font_size=sp(11))
+            short = path.replace("/storage/emulated/0","[INT]").replace("/sdcard","[INT]")
+            info.add_widget(Label(text=short, font_size=sp(11), bold=True,
+                                  color=hc(C["text"]), halign="left",
+                                  size_hint_y=None, height=dp(24)))
+            info.add_widget(Label(text=f"{count} file MP3", font_size=sp(10),
+                                  color=hc(C["accent"]), halign="left",
+                                  size_hint_y=None, height=dp(20)))
+            btn = DkBtn(text="Seleziona", size_hint_x=0.30, bg=hc(C["primary"]),
+                        font_size=sp(11))
             btn.bind(on_press=lambda _, p=path: self._pick(p))
-            row.add_widget(info); row.add_widget(btn)
-            self._grid.add_widget(row)
+            row.add_widget(info); row.add_widget(btn); self._grid.add_widget(row)
 
-    def _pick(self, path):
-        self.dismiss(); self._cb(path)
-
+    def _pick(self, path): self.dismiss(); self._cb(path)
     def _custom(self, *_):
         p = self._inp.text.strip()
         if p: self.dismiss(); self._cb(p)
@@ -579,12 +549,11 @@ class LibraryScreen(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
         self._filtered = []
-        self._perm_ok = not ANDROID  # su desktop non serve
+        self._perm_ok = not ANDROID
         self._build()
         state.on("song", self._highlight)
-        # Richiedi permessi all'avvio
         if ANDROID:
-            Clock.schedule_once(self._check_perms, 1.0)
+            Clock.schedule_once(self._check_perms, 1.5)
 
     def _check_perms(self, *_):
         _request_storage_permissions(self._on_perm_result)
@@ -592,113 +561,106 @@ class LibraryScreen(Screen):
     def _on_perm_result(self, ok):
         self._perm_ok = ok
         if ok:
-            # Rimuovi banner se presente
-            if hasattr(self, "_perm_banner") and self._perm_banner.parent:
-                self._main_col.remove_widget(self._perm_banner)
-            self.status.text = "Permessi OK - tocca SCANSIONA per analizzare"
+            self.status.text = "Permessi OK - premi SCANSIONA"
+            if hasattr(self,"_perm_row") and self._perm_row.parent:
+                self._main_col.remove_widget(self._perm_row)
         else:
-            self.status.text = "!! Permessi storage negati !!"
+            self.status.text = "!! Permessi storage negati - tocca ABILITA"
 
     def _build(self):
-        root = BoxLayout(orientation="vertical", spacing=dp(0),
-                         padding=[dp(10), dp(8), dp(10), dp(6)])
-        with root.canvas.before:
+        self._main_col = BoxLayout(
+            orientation="vertical", spacing=dp(0),
+            padding=[dp(10),dp(8),dp(10),dp(6)])
+        with self._main_col.canvas.before:
             Color(*hc(C["bg"]))
-            self._root_bg = Rectangle(pos=root.pos, size=root.size)
-        root.bind(pos=lambda *_: setattr(self._root_bg,"pos",root.pos),
-                  size=lambda *_: setattr(self._root_bg,"size",root.size))
+            self._root_bg = Rectangle(pos=self._main_col.pos, size=self._main_col.size)
+        self._main_col.bind(
+            pos=lambda *_: setattr(self._root_bg,"pos",self._main_col.pos),
+            size=lambda *_: setattr(self._root_bg,"size",self._main_col.size))
 
-        # ── Banner permessi (visibile se non granted) ──
-        self._perm_banner = PermBanner(
-            on_grant=self._on_perm_result,
-            size_hint_y=None, height=dp(68))
+        # Banner permessi
+        self._perm_row = RndRect(bg=C["warn"], radius=10, size_hint_y=None,
+                                 height=dp(52), spacing=dp(8), padding=[dp(12),dp(6)])
+        perm_info = BoxLayout(orientation="vertical", size_hint_x=0.70)
+        perm_info.add_widget(Label(text="Servono permessi storage",
+                                   font_size=sp(12), bold=True, color=hc("#FFF"),
+                                   halign="left", size_hint_y=None, height=dp(22)))
+        perm_info.add_widget(Label(text="Tocca ABILITA per concederli",
+                                   font_size=sp(10), color=hc("#FFE"), halign="left",
+                                   size_hint_y=None, height=dp(18)))
+        perm_btn = DkBtn(text="ABILITA", size_hint_x=0.30, bg=hc(C["success"]),
+                         font_size=sp(12))
+        perm_btn.bind(on_press=lambda *_: _request_storage_permissions(self._on_perm_result))
+        self._perm_row.add_widget(perm_info); self._perm_row.add_widget(perm_btn)
         if ANDROID:
-            root.add_widget(self._perm_banner)
+            self._main_col.add_widget(self._perm_row)
 
-        # ── Titolo ──
-        title_row = BoxLayout(size_hint_y=None, height=dp(40))
-        title_row.add_widget(Label(
-            text="MUSIC MOOD ANALYZER",
-            font_size=sp(16), bold=True,
-            color=hc(C["accent"]), halign="center"))
-        root.add_widget(title_row)
+        # Titolo
+        self._main_col.add_widget(Label(
+            text="MUSIC MOOD ANALYZER", font_size=sp(16), bold=True,
+            color=hc(C["accent"]), size_hint_y=None, height=dp(38)))
 
-        # ── Barra ricerca + pulsante ──
+        # Header ricerca + scan
         hdr = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
         self.search = TextInput(
             hint_text="Cerca brano...",
-            background_color=hc(C["card"]),
-            foreground_color=hc(C["text"]),
-            hint_text_color=hc(C["subtext"]),
-            font_size=sp(13), multiline=False,
-            size_hint_x=0.55, padding=[dp(10), dp(12)])
+            background_color=hc(C["card"]), foreground_color=hc(C["text"]),
+            hint_text_color=hc(C["subtext"]), font_size=sp(13),
+            multiline=False, size_hint_x=0.55, padding=[dp(10),dp(12)])
         self.search.bind(text=lambda *_: self._refresh())
-
-        scan_btn = DkBtn(text="SCANSIONA", size_hint_x=0.45,
-                         bg=hc(C["primary"]))
+        scan_btn = DkBtn(text="SCANSIONA", size_hint_x=0.45, bg=hc(C["primary"]))
         scan_btn.bind(on_press=self._open_picker)
         hdr.add_widget(self.search); hdr.add_widget(scan_btn)
-        root.add_widget(hdr)
+        self._main_col.add_widget(hdr)
 
-        # ── Filtri ──
+        # Filtri
         frow = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
-        self.mood_sp = Spinner(
-            text="Mood: Tutti",
-            values=["Mood: Tutti"] + MOODS,
-            background_normal="", background_color=hc(C["card2"]),
-            color=hc(C["text"]), font_size=sp(11))
-        self.genre_sp = Spinner(
-            text="Genere: Tutti",
-            values=["Genere: Tutti"] + GENRES,
-            background_normal="", background_color=hc(C["card2"]),
-            color=hc(C["text"]), font_size=sp(11))
+        self.mood_sp = Spinner(text="Mood: Tutti", values=["Mood: Tutti"]+MOODS,
+                               background_normal="", background_color=hc(C["card2"]),
+                               color=hc(C["text"]), font_size=sp(11))
+        self.genre_sp = Spinner(text="Genere: Tutti", values=["Genere: Tutti"]+GENRES,
+                                background_normal="", background_color=hc(C["card2"]),
+                                color=hc(C["text"]), font_size=sp(11))
         self.cnt = Label(text="0 brani", font_size=sp(11),
                          color=hc(C["accent"]), size_hint_x=0.28)
         self.mood_sp.bind(text=lambda *_: self._refresh())
         self.genre_sp.bind(text=lambda *_: self._refresh())
         frow.add_widget(self.mood_sp); frow.add_widget(self.genre_sp)
         frow.add_widget(self.cnt)
-        root.add_widget(frow)
+        self._main_col.add_widget(frow)
 
-        # ── Status + progress ──
+        # Status + progress
         self.status = Label(
-            text="Tocca SCANSIONA per analizzare la tua musica",
+            text="Premi SCANSIONA per analizzare la tua musica",
             font_size=sp(11), color=hc(C["subtext"]),
             size_hint_y=None, height=dp(18))
         self.pbar = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(5))
-        root.add_widget(self.status); root.add_widget(self.pbar)
+        self._main_col.add_widget(self.status)
+        self._main_col.add_widget(self.pbar)
+        self._main_col.add_widget(BoxLayout(size_hint_y=None, height=dp(4)))
 
-        # Separatore
-        root.add_widget(BoxLayout(size_hint_y=None, height=dp(4)))
+        # Lista
+        self.rv = SongRV(size_hint=(1,1))
+        self._main_col.add_widget(self.rv)
 
-        # ── Lista brani ──
-        self.rv = SongRV(size_hint=(1, 1))
-        root.add_widget(self.rv)
-
-        # ── Pulsanti mood rapidi ──
-        root.add_widget(BoxLayout(size_hint_y=None, height=dp(6)))
-        mood_lbl = Label(text="Riproduci per mood:",
-                         font_size=sp(10), color=hc(C["subtext"]),
-                         size_hint_y=None, height=dp(16))
-        root.add_widget(mood_lbl)
+        # Mood rapidi
+        self._main_col.add_widget(Label(
+            text="Riproduci per mood:", font_size=sp(10), color=hc(C["subtext"]),
+            size_hint_y=None, height=dp(16)))
         mrow = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
-        mood_labels = {
-            "Energetic":"ENERGETIC","Positive":"POSITIVE",
-            "Aggressive":"AGGRESS.","Melancholic":"MELANC."
-        }
+        short_mood = {"Energetic":"ENERG.","Positive":"POS.",
+                      "Aggressive":"AGGR.","Melancholic":"MEL."}
         for mood in MOODS:
-            b = DkBtn(text=mood_labels[mood],
-                      bg=hc(MOOD_COLORS[mood]),
-                      size_hint_x=0.25, font_size=sp(10))
+            b = DkBtn(text=short_mood[mood], bg=hc(MOOD_COLORS[mood]),
+                      size_hint_x=0.25, font_size=sp(11))
             b.bind(on_press=lambda _, m=mood: self._play_mood(m))
             mrow.add_widget(b)
-        root.add_widget(mrow)
-        self.add_widget(root)
-        self._main_col = root
+        self._main_col.add_widget(mrow)
+        self.add_widget(self._main_col)
 
     def _get_filtered(self):
         q = self.search.text.lower().strip()
-        mood = self.mood_sp.text.replace("Mood: Tutti", "").replace("Mood: ","")
+        mood = self.mood_sp.text.replace("Mood: Tutti","").replace("Mood: ","")
         genre = self.genre_sp.text.replace("Genere: Tutti","").replace("Genere: ","")
         return [s for s in state.all_songs
                 if (not q or q in s.get("title","").lower())
@@ -707,7 +669,7 @@ class LibraryScreen(Screen):
 
     def _refresh(self, *_):
         self._filtered = self._get_filtered(); cur = state.current_song
-        self.rv.data = [{"song": s, "selected": bool(cur and s.get("path")==cur.get("path"))}
+        self.rv.data = [{"song":s,"selected":bool(cur and s.get("path")==cur.get("path"))}
                         for s in self._filtered]
         self.cnt.text = f"{len(self._filtered)} brani"
 
@@ -715,54 +677,58 @@ class LibraryScreen(Screen):
 
     def _open_picker(self, *_):
         if ANDROID and not self._perm_ok:
+            _request_storage_permissions(self._on_perm_result)
             self._toast(
                 "Permessi storage non concessi.\n\n"
-                "Tocca il pulsante 'Abilita' in alto\noppure vai in:\n"
-                "Impostazioni > Applicazioni >\nMusic Mood Analyzer > Autorizzazioni\n"
+                "Tocca ABILITA in cima allo schermo.\n\n"
+                "Se non funziona vai in:\n"
+                "Impostazioni > Applicazioni >\n"
+                "Music Mood Analyzer > Autorizzazioni\n"
                 "e abilita 'File e file multimediali'.")
             return
         FolderPickerPopup(on_folder_selected=self._do_scan).open()
 
     def _do_scan(self, folder):
         folder = folder.strip()
-        if not folder:
-            self._toast("Percorso vuoto."); return
+        if not folder: self._toast("Percorso vuoto."); return
         if not os.path.isdir(folder):
             self._toast(
                 f"Cartella non trovata:\n{folder}\n\n"
-                "Verifica il percorso.\n"
-                "Nota: su Android i file sono in\n"
-                "/storage/emulated/0/Music"); return
+                "Percorsi comuni Android:\n"
+                "/storage/emulated/0/Music\n"
+                "/storage/emulated/0/Download")
+            return
         n = _count_mp3(folder)
         if n == 0:
             self._toast(
-                f"Nessun file .mp3 trovato in:\n{folder}\n\n"
-                "Controlla che la cartella contenga\nfile MP3 e che i permessi siano OK."); return
+                f"Nessun file MP3 in:\n{folder}\n\n"
+                "Controlla permessi storage e\n"
+                "che la cartella contenga file .mp3")
+            return
 
-        self.status.text = f"Analisi in corso... {n} brani trovati"
+        self.status.text = f"Analisi {n} brani in corso..."
         self.pbar.value = 2
 
         def _prog(cur, tot, fname):
             pct = cur/tot*100 if tot else 0
-            short = fname[:28] if len(fname) > 28 else fname
             Clock.schedule_once(
-                lambda dt: self._upd(pct, f"[{cur}/{tot}] {short}"), 0)
+                lambda dt: self._upd(pct, f"[{cur}/{tot}] {fname[:28]}"), 0)
 
         def _worker():
             try:
                 songs = scan_folders([folder], progress_callback=_prog)
-                Clock.schedule_once(lambda dt: self._done(songs, folder), 0)
+                Clock.schedule_once(lambda dt: self._done(songs), 0)
             except Exception as e:
                 import traceback as tb
-                Clock.schedule_once(
-                    lambda dt: self._err(str(e), tb.format_exc()), 0)
+                err = tb.format_exc()
+                _log(f"[scan] ERRORE: {err}")
+                Clock.schedule_once(lambda dt: self._err(str(e)), 0)
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _upd(self, pct, txt):
-        self.pbar.value = pct; self.status.text = txt
+    def _upd(self, pct, txt): self.pbar.value=pct; self.status.text=txt
 
-    def _done(self, songs, folder):
+    def _done(self, songs):
         self.pbar.value = 100
         if songs:
             state.all_songs = songs
@@ -772,24 +738,22 @@ class LibraryScreen(Screen):
             self.status.text = "Attenzione: 0 brani elaborati"
             self._toast(
                 "Analisi completata ma 0 brani.\n\n"
-                "Possibili cause:\n"
-                "- Permessi storage non completi\n"
-                "- File MP3 non leggibili\n\n"
-                "Su Android 11+: vai in Impostazioni >\n"
-                "Applicazioni > Music Mood Analyzer >\n"
-                "Autorizzazioni > File e file multimediali\n"
-                "e imposta 'Consenti accesso a tutti i file'.")
+                "Controlla:\n"
+                "1. Permessi storage concessi?\n"
+                "2. Impostazioni > App > Music Mood\n"
+                "   > Autorizzazioni > File\n"
+                "   > 'Consenti accesso a tutti i file'")
 
-    def _err(self, short, full):
+    def _err(self, short):
         self.pbar.value = 0
         self.status.text = f"Errore: {short[:50]}"
-        self._toast(f"Errore scansione:\n\n{short[:250]}")
-        print("[SCAN ERROR]", full)
+        self._toast(f"Errore durante la scansione:\n\n{short[:280]}\n\n"
+                    f"Log completo in:\n{_LOG_PATH or 'logcat'}")
 
     def _play_mood(self, mood):
         genre = self.genre_sp.text.replace("Genere: Tutti","").replace("Genere: ","")
         if not state.play_mood(mood, genre or "All"):
-            self._toast(f"Nessun brano con mood: {mood}\n\nEsegui prima una scansione.")
+            self._toast(f"Nessun brano con mood: {mood}\nEsegui prima una scansione.")
         else:
             App.get_running_app().go("player")
 
@@ -800,10 +764,8 @@ class LibraryScreen(Screen):
         lbl.bind(texture_size=lambda l,s: setattr(l,"height",s[1]+dp(4)))
         c.add_widget(lbl)
         b = DkBtn(text="OK", size_hint_y=None, height=dp(44))
-        p = Popup(title="Info", content=c,
-                  size_hint=(0.88, None), height=dp(360),
-                  background_color=hc(C["surface"]),
-                  title_color=hc(C["text"]))
+        p = Popup(title="Avviso", content=c, size_hint=(0.88,None), height=dp(380),
+                  background_color=hc(C["surface"]), title_color=hc(C["text"]))
         b.bind(on_press=p.dismiss); c.add_widget(b); p.open()
 
 
@@ -817,111 +779,88 @@ class PlayerScreen(Screen):
         Clock.schedule_interval(self._tick, 0.5)
 
     def _build(self):
-        root = BoxLayout(orientation="vertical", spacing=dp(12),
-                         padding=[dp(16), dp(16), dp(16), dp(12)])
+        root = BoxLayout(orientation="vertical", spacing=dp(10),
+                         padding=[dp(16),dp(14),dp(16),dp(10)])
         with root.canvas.before:
-            Color(*hc(C["bg"]))
-            self._bg = Rectangle(pos=root.pos, size=root.size)
-        root.bind(pos=lambda *_: setattr(self._bg,"pos",root.pos),
-                  size=lambda *_: setattr(self._bg,"size",root.size))
+            Color(*hc(C["bg"])); self._bg=Rectangle(pos=root.pos,size=root.size)
+        root.bind(pos=lambda *_:setattr(self._bg,"pos",root.pos),
+                  size=lambda *_:setattr(self._bg,"size",root.size))
 
-        # ── Artwork box ──
-        art_box = RndRect(bg=C["card"], radius=16,
-                          size_hint_y=None, height=dp(150))
-        self.art = Label(text="[PLAY]", font_size=sp(28), bold=True,
+        # Artwork
+        self._art_box = RndRect(bg=C["card"], radius=16, size_hint_y=None, height=dp(140))
+        self.art = Label(text="IN RIPRODUZIONE", font_size=sp(16), bold=True,
                          color=hc(C["accent"]))
-        art_box.add_widget(self.art)
-        root.add_widget(art_box)
+        self._art_box.add_widget(self.art)
+        root.add_widget(self._art_box)
 
-        # ── Mood badge ──
         self.badge = Label(text="", font_size=sp(13), bold=True,
-                           color=hc(C["accent"]),
-                           size_hint_y=None, height=dp(24))
+                           color=hc(C["accent"]), size_hint_y=None, height=dp(22))
         root.add_widget(self.badge)
 
-        # ── Titolo ──
-        self.title_lbl = Label(
-            text="Nessun brano in riproduzione",
-            font_size=sp(15), bold=True,
-            color=hc(C["text"]),
-            size_hint_y=None, height=dp(46),
-            halign="center", text_size=(None, None))
+        self.title_lbl = Label(text="Nessun brano in riproduzione",
+                               font_size=sp(14), bold=True, color=hc(C["text"]),
+                               size_hint_y=None, height=dp(44),
+                               halign="center", text_size=(None,None))
         root.add_widget(self.title_lbl)
 
-        # ── Meta ──
-        self.meta = Label(text="", font_size=sp(12),
-                          color=hc(C["subtext"]),
+        self.meta = Label(text="", font_size=sp(12), color=hc(C["subtext"]),
                           size_hint_y=None, height=dp(20))
         root.add_widget(self.meta)
 
-        # ── Progress ──
         self.prog = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(6))
         root.add_widget(self.prog)
         self.time_lbl = Label(text="0:00 / 0:00", font_size=sp(11),
-                              color=hc(C["subtext"]),
-                              size_hint_y=None, height=dp(18))
+                              color=hc(C["subtext"]), size_hint_y=None, height=dp(18))
         root.add_widget(self.time_lbl)
 
-        # ── Controlli principali ──
-        ctrl = BoxLayout(size_hint_y=None, height=dp(62), spacing=dp(10))
-        prev_b = DkBtn(text="<< Prec", font_size=sp(13), bg=hc(C["card2"]))
-        prev_b.bind(on_press=lambda *_: state.prev())
-        self.play_b = DkBtn(text="  PLAY  ", font_size=sp(15), bold=True,
-                            bg=hc(C["primary"]))
-        self.play_b.font_size = sp(16)
-        self.play_b.bind(on_press=lambda *_: state.toggle_pause())
-        next_b = DkBtn(text="Succ >>", font_size=sp(13), bg=hc(C["card2"]))
-        next_b.bind(on_press=lambda *_: state.next())
+        ctrl = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(8))
+        prev_b = DkBtn(text="<< PREC", font_size=sp(12), bg=hc(C["card2"]))
+        prev_b.bind(on_press=lambda *_:state.prev())
+        self.play_b = DkBtn(text="  PLAY  ", font_size=sp(15), bold=True, bg=hc(C["primary"]))
+        self.play_b.bind(on_press=lambda *_:state.toggle_pause())
+        next_b = DkBtn(text="SUCC >>", font_size=sp(12), bg=hc(C["card2"]))
+        next_b.bind(on_press=lambda *_:state.next())
         ctrl.add_widget(prev_b); ctrl.add_widget(self.play_b); ctrl.add_widget(next_b)
         root.add_widget(ctrl)
 
-        # ── Controlli secondari ──
-        ctrl2 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        ctrl2 = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
         self.loop_b = DkBtn(text="Loop: OFF", font_size=sp(12), bg=hc(C["card2"]))
         self.shuf_b = DkBtn(text="Shuffle: OFF", font_size=sp(12), bg=hc(C["card2"]))
         stop_b = DkBtn(text="STOP", font_size=sp(12), bg=hc(C["danger"]))
         self.loop_b.bind(on_press=self._loop)
         self.shuf_b.bind(on_press=self._shuf)
-        stop_b.bind(on_press=lambda *_: state.stop())
-        ctrl2.add_widget(self.loop_b); ctrl2.add_widget(self.shuf_b)
-        ctrl2.add_widget(stop_b)
+        stop_b.bind(on_press=lambda *_:state.stop())
+        ctrl2.add_widget(self.loop_b); ctrl2.add_widget(self.shuf_b); ctrl2.add_widget(stop_b)
         root.add_widget(ctrl2)
 
-        # ── Volume ──
-        vrow = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        vrow.add_widget(Label(text="VOL", font_size=sp(11),
-                              color=hc(C["subtext"]),
+        vrow = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+        vrow.add_widget(Label(text="VOL", font_size=sp(11), color=hc(C["subtext"]),
                               size_hint_x=None, width=dp(32)))
         self.vol = Slider(min=0, max=1, value=1)
-        self.vol.bind(value=lambda _, v: state.set_vol(v))
+        self.vol.bind(value=lambda _,v: state.set_vol(v))
         vrow.add_widget(self.vol)
-        vrow.add_widget(Label(text="MAX", font_size=sp(11),
-                              color=hc(C["subtext"]),
+        vrow.add_widget(Label(text="MAX", font_size=sp(11), color=hc(C["subtext"]),
                               size_hint_x=None, width=dp(32)))
         root.add_widget(vrow)
         self.add_widget(root)
 
     def _upd(self, song, *_):
         if not song:
-            self.title_lbl.text = "Nessun brano in riproduzione"
-            self.badge.text = ""
-            self.meta.text = ""
-            self.art.text = "[PLAY]"
-            self.play_b.text = "  PLAY  "
-            return
+            self.title_lbl.text="Nessun brano in riproduzione"
+            self.badge.text=""; self.meta.text=""
+            self.art.text="IN RIPRODUZIONE"; self.play_b.text="  PLAY  "; return
         t = song.get("title","")
-        if t.lower().endswith(".mp3"): t = t[:-4]
-        if len(t) > 30: t = t[:30] + "..."
-        mood = song.get("mood","")
-        genre = song.get("genre","?")
-        if song.get("genre_alt"): genre += "/" + song["genre_alt"]
+        if t.lower().endswith(".mp3"): t=t[:-4]
+        if len(t)>28: t=t[:28]+"..."
+        mood = song.get("mood",""); genre=song.get("genre","?")
+        if song.get("genre_alt"): genre+="/"+song["genre_alt"]
         self.title_lbl.text = t
-        tag = MOOD_TAG.get(mood, mood.upper()[:6] if mood else "")
-        self.badge.text = f"-- {tag} --"
+        tag = MOOD_TAG.get(mood, mood.upper() if mood else "")
+        self.badge.text = f"--- {tag} ---"
         self.badge.color = hc(MOOD_COLORS.get(mood, C["accent"]))
         mode = "Maggiore" if song.get("mode_major") else "Minore"
         self.meta.text = f"{genre}  |  {song.get('tempo',0):.0f} BPM  |  {mode}"
-        self.art.text = f">> {tag} <<"
+        self.art.text = tag
         self.art.color = hc(MOOD_COLORS.get(mood, C["accent"]))
         self.play_b.text = " PAUSA  " if state.is_playing() else "  PLAY  "
 
@@ -947,71 +886,66 @@ class PlayerScreen(Screen):
 # StatsScreen
 # =============================================================================
 class StatsScreen(Screen):
-    def __init__(self, **kw):
-        super().__init__(**kw); self._build()
+    def __init__(self, **kw): super().__init__(**kw); self._build()
 
     def _build(self):
         root = BoxLayout(orientation="vertical", spacing=dp(8),
-                         padding=[dp(12), dp(10), dp(12), dp(10)])
+                         padding=[dp(12),dp(10),dp(12),dp(10)])
         with root.canvas.before:
-            Color(*hc(C["bg"]))
-            self._bg = Rectangle(pos=root.pos, size=root.size)
-        root.bind(pos=lambda *_: setattr(self._bg,"pos",root.pos),
-                  size=lambda *_: setattr(self._bg,"size",root.size))
-
-        root.add_widget(Label(text="STATISTICHE ASCOLTI",
-                              font_size=sp(16), bold=True,
-                              color=hc(C["accent"]),
-                              size_hint_y=None, height=dp(42)))
-        rb = DkBtn(text="Aggiorna statistiche",
-                   size_hint_y=None, height=dp(40),
-                   bg=hc(C["primary"]))
-        rb.bind(on_press=lambda *_: self._load())
-        root.add_widget(rb)
-
+            Color(*hc(C["bg"])); self._bg=Rectangle(pos=root.pos,size=root.size)
+        root.bind(pos=lambda *_:setattr(self._bg,"pos",root.pos),
+                  size=lambda *_:setattr(self._bg,"size",root.size))
+        root.add_widget(Label(text="STATISTICHE ASCOLTI", font_size=sp(16), bold=True,
+                              color=hc(C["accent"]), size_hint_y=None, height=dp(40)))
+        rb = DkBtn(text="Aggiorna", size_hint_y=None, height=dp(40), bg=hc(C["primary"]))
+        rb.bind(on_press=lambda *_: self._load()); root.add_widget(rb)
         sc = ScrollView()
-        self.grid = GridLayout(cols=1, spacing=dp(8),
-                               size_hint_y=None, padding=[dp(4), dp(4)])
+        self.grid = GridLayout(cols=1, spacing=dp(8), size_hint_y=None, padding=[dp(4),dp(4)])
         self.grid.bind(minimum_height=self.grid.setter("height"))
-        sc.add_widget(self.grid); root.add_widget(sc)
-        self.add_widget(root)
-        self._load()
+        sc.add_widget(self.grid); root.add_widget(sc); self.add_widget(root); self._load()
 
     def on_enter(self): self._load()
 
     def _load(self, *_):
         self.grid.clear_widgets()
-        total  = lh.get_total_plays()
-        mood_d = lh.get_mood_distribution_last_n_days(7)
-        genre_d= lh.get_genre_distribution_last_n_days(7)
-        top    = lh.get_most_played_songs_last_n_days(7, 5)
-        slots  = lh.get_time_slot_mood_preference()
+        try:
+            total  = lh.get_total_plays()
+            mood_d = lh.get_mood_distribution_last_n_days(7)
+            genre_d= lh.get_genre_distribution_last_n_days(7)
+            top    = lh.get_most_played_songs_last_n_days(7, 5)
+            slots  = lh.get_time_slot_mood_preference()
+        except Exception as e:
+            self._card(f"Errore caricamento statistiche:\n{e}"); return
 
         self._card(f"Totale riproduzioni: {total}")
         self._card(f"Brani in libreria: {len(state.all_songs)}")
         if mood_d:
-            self._card("Mood (ultimi 7 giorni):\n" + "\n".join(
-                f"  {MOOD_TAG.get(m,m[:4].upper())}: {c}" for m,c in mood_d.items()))
+            self._card("Mood (ultimi 7 giorni):\n" +
+                       "\n".join(f"  {MOOD_TAG.get(m,m)}: {c}" for m,c in mood_d.items()))
         if genre_d:
-            self._card("Generi (ultimi 7 giorni):\n" + "\n".join(
-                f"  {g}: {c}" for g,c in genre_d.items()))
+            self._card("Generi (ultimi 7 giorni):\n" +
+                       "\n".join(f"  {g}: {c}" for g,c in genre_d.items()))
         if slots:
-            slot_lbl = {"morning":"Mattina","afternoon":"Pomeriggio",
-                        "evening":"Sera","night":"Notte"}
-            self._card("Preferenze orarie:\n" + "\n".join(
-                f"  {slot_lbl.get(k,k)}: {v}" for k,v in slots.items()))
+            sl = {"morning":"Mattina","afternoon":"Pomeriggio",
+                  "evening":"Sera","night":"Notte"}
+            self._card("Preferenze orarie:\n" +
+                       "\n".join(f"  {sl.get(k,k)}: {v}" for k,v in slots.items()))
         if top:
-            self._card("Top 5 brani (7 giorni):\n" + "\n".join(
-                f"  {i+1}. {s['song_title'][:32]} ({s['play_count']}x)"
-                for i,s in enumerate(top)))
+            self._card("Top 5 brani (7 giorni):\n" +
+                       "\n".join(f"  {i+1}. {s['song_title'][:30]} ({s['play_count']}x)"
+                                 for i,s in enumerate(top)))
+        if _LOG_PATH and os.path.exists(_LOG_PATH):
+            try:
+                with open(_LOG_PATH) as f: log_txt = f.read()[-500:]
+                self._card(f"Log avvio:\n{log_txt}")
+            except Exception:
+                pass
 
     def _card(self, txt):
         lbl = Label(text=txt, font_size=sp(12), color=hc(C["text"]),
-                    size_hint_y=None, halign="left", valign="top",
-                    text_size=(None, None))
+                    size_hint_y=None, halign="left", valign="top", text_size=(None,None))
         lbl.bind(texture_size=lambda l,s: setattr(l,"height",s[1]+dp(20)))
-        card = RndRect(bg=C["card"], radius=10, size_hint_y=None,
-                       padding=[dp(14), dp(10)])
+        card = RndRect(bg=C["card"], radius=10, size_hint_y=None, padding=[dp(14),dp(10)])
         card.bind(minimum_height=card.setter("height"))
         card.add_widget(lbl); self.grid.add_widget(card)
 
@@ -1021,57 +955,62 @@ class StatsScreen(Screen):
 # =============================================================================
 class NavBar(BoxLayout):
     def __init__(self, sm, **kw):
-        super().__init__(**kw)
-        self.sm = sm
-        self.orientation = "horizontal"
-        self.size_hint_y = None
-        self.height = dp(54)
+        super().__init__(**kw); self.sm=sm
+        self.orientation="horizontal"; self.size_hint_y=None; self.height=dp(54)
         with self.canvas.before:
-            Color(*hc(C["surface"]))
-            self._bg = Rectangle(pos=self.pos, size=self.size)
-        self.bind(pos=lambda *_: setattr(self._bg,"pos",self.pos),
-                  size=lambda *_: setattr(self._bg,"size",self.size))
-        self._btns = {}
-        tabs = [("library","Libreria"), ("player","Player"), ("stats","Stats")]
-        for name, lbl in tabs:
-            b = Button(text=lbl, font_size=sp(13), bold=False,
-                       background_normal="", background_color=[0,0,0,0],
-                       color=hc(C["subtext"]))
+            Color(*hc(C["surface"])); self._bg=Rectangle(pos=self.pos,size=self.size)
+        self.bind(pos=lambda *_:setattr(self._bg,"pos",self.pos),
+                  size=lambda *_:setattr(self._bg,"size",self.size))
+        self._btns={}
+        for name, lbl in [("library","Libreria"),("player","Player"),("stats","Stats")]:
+            b = Button(text=lbl, font_size=sp(13), background_normal="",
+                       background_color=[0,0,0,0], color=hc(C["subtext"]))
             b.bind(on_press=lambda _, n=name: self._go(n))
-            self._btns[name] = b; self.add_widget(b)
+            self._btns[name]=b; self.add_widget(b)
         self._active("library")
 
-    def _go(self, name): self.sm.current = name; self._active(name)
+    def _go(self, name): self.sm.current=name; self._active(name)
     def _active(self, name):
-        for n, b in self._btns.items():
-            b.color = hc(C["accent"]) if n == name else hc(C["subtext"])
-            b.bold  = (n == name)
+        for n,b in self._btns.items():
+            b.color = hc(C["accent"]) if n==name else hc(C["subtext"])
+            b.bold  = (n==name)
 
 
 class MusicMoodApp(App):
     def build(self):
+        _log("build() avviato")
         self.title = "Music Mood Analyzer"
         root = BoxLayout(orientation="vertical")
         with root.canvas.before:
-            Color(*hc(C["bg"]))
-            Rectangle(pos=root.pos, size=root.size)
+            Color(*hc(C["bg"])); Rectangle(pos=root.pos,size=root.size)
         self.sm = ScreenManager(transition=FadeTransition(duration=0.12))
-        self.sm.add_widget(LibraryScreen(name="library"))
-        self.sm.add_widget(PlayerScreen(name="player"))
-        self.sm.add_widget(StatsScreen(name="stats"))
+        try:
+            self.sm.add_widget(LibraryScreen(name="library"))
+            self.sm.add_widget(PlayerScreen(name="player"))
+            self.sm.add_widget(StatsScreen(name="stats"))
+            _log("Schermate create OK")
+        except Exception as e:
+            _log(f"ERRORE creazione schermate: {e}")
+            raise
         self.nav = NavBar(self.sm)
         root.add_widget(self.sm); root.add_widget(self.nav)
+        _log("build() completato")
         return root
 
-    def go(self, name):
-        self.sm.current = name; self.nav._active(name)
+    def go(self, name): self.sm.current=name; self.nav._active(name)
 
     def on_song_tap(self, song):
-        lib = self.sm.get_screen("library")
-        fl = lib._filtered
+        lib = self.sm.get_screen("library"); fl=lib._filtered
         idx = fl.index(song) if song in fl else 0
         state.play_list(fl, idx); self.go("player")
 
 
 if __name__ == "__main__":
-    MusicMoodApp().run()
+    _log("Avvio MusicMoodApp")
+    try:
+        MusicMoodApp().run()
+    except Exception as e:
+        _log(f"CRASH: {e}")
+        import traceback
+        _log(traceback.format_exc())
+        raise
