@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/25603236/README.md)
+[README.md](https://github.com/user-attachments/files/25603761/README.md)
 # 🎵 Music Mood Analyzer — Versione Kivy (Android)
 
 Riscrittura completa per Android dell'app originale, usando **Kivy** al posto di
